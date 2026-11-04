@@ -161,3 +161,29 @@ A migration that has to spell a word in a `CHECK` copies it from here and a test
   The entry semantics: `runtime: python` with an `entry` runs `python /code/<entry>` followed by `args`; a `command` runs as given with `args` appended; `runtime: image` with an `entry` runs `/code/<entry>` directly (it needs the executable bit, which the bundle packer must preserve); the runtime image must provide `python` on its PATH for the python runtime; a bundle's member names may carry a leading `./`, and absolute names, `..`, links, devices and named pipes (first in, first out, or FIFOs) are refused by the launcher.
   Their texts are `COMPUTE_ENTRY_DESCRIPTION`, `COMPUTE_COMMAND_DESCRIPTION`, `COMPUTE_ARGS_DESCRIPTION` and `COMPUTE_INCLUDE_DESCRIPTION`, carried by zod and, word for word, by the schema.
 - **Header.** `shared/compute-header.ts`, import-free: `parseJobHeader` for a `# /// nemar` or `% /// nemar` block or a whole `nemar-job.toml` (a small TOML subset, every refusal a fixed code with its line), and `headerToSpecFields`, which maps `memory`, `time` and `id@version` onto specification fields.
+
+## 7. Ledger and owner policy shipped in phase A2 (ADR 0118, amendment of 2026-11-04)
+
+Call these; never write a second statement that moves a total.
+
+- **Tables** (migration `0114_compute_ledger.sql`): `compute_policy` (one immutable row per version), `compute_pools` (holder kind `account|platform|partner`, holder ref, pool `cpu|gpu`, three totals; the four platform pools `pipelines` and `people`, each cpu and gpu, are seeded) and `compute_ledger` (the eight entry kinds, append-only).
+  The trigger `compute_ledger_apply` is the one writer of a pool's totals; a test reads every source file and migration for another.
+  The table itself refuses, under every conflict clause, an entry that would take a total outside 0 to 2^53 - 1, a hold that would take available below 0, and a release or charge that does not close its own hold.
+  A hold, release, charge, overrun and a job's final-settlement adjustment on an account or partner pool MUST name the platform `people` pool of the same word as its budget (`budgetPoolId`), or the table raises; a budget that is named is always that pool, and an entry on a platform pool names none.
+  A refund and an adjustment of a charge that names no job are free: they may name the `people` budget or none, because whether they credit it back is the owner's open decision (below) and a code choice, not a schema rule.
+  A job has one hold; a hold is closed once; a job's final settlement is one `adjust` entry that carries the job (its charged delta may be 0).
+  Retention and anonymisation of `holder_ref` and `actor_user_id` are phase A7's (#2012), in its own migration with a narrowly scoped exception; nothing here removes a row.
+- **Service** (`backend/src/services/compute-ledger.ts`, every statement exported as `*_SQL`): `ensurePool`, `holdStatements` and `placeHold` (the one conditional INSERT, with `extraGuards` for phase A3's job-count guards: boolean SQL with plain `?` placeholders and its values, ANDed into the same WHERE), `releaseHold`, `settleProvisional` (a `charge` and any `overrun` in one statement), `settleFinal` (one `adjust`, once per job, refused after a refund), `refundJob`, `grantPool`, `adjustPool`, `expireUnused` and `availableMilli` (may be negative).
+  Each answers `{ ok: false, code }` for a refusal and writes nothing; `ComputeLedgerError` (`invalid_argument`, `idempotency_conflict`, `pool_not_found`) is thrown for what is not a refusal.
+  The hold's refusals are `insufficient_balance`, `suspended`, `platform_budget_exhausted` and `guard_refused` (the words of `shared/compute-state.ts`).
+  A hold takes no key: its key is the job's (`holdKey(jobId)`), so a hold of the same job again is a replay while the hold is open, a conflict if the request differs, and `hold_closed` (`closedBy` says `released` or `settled`) once the hold was released or settled: a caller must not read a replay as a hold that is live.
+  A closing step replayed returns its entry with `replayed: true`; `hold_closed` says which kind closed the hold (`closedBy`).
+  The keys the service writes are `holdKey`, `finalKey` and `refundKey` of the job and `hold:<id>:<step>` of the hold; a caller's key may not start with `job:` or `hold:`; an administrator's route stores its header key behind `adminKey(kind, actorId, key)`.
+- **Policy** (`compute-policy.ts`): `getPolicy` (strict, default only when there is no row, `ComputePolicyUnreadable` for a row it cannot parse, which a route answers 503) and `putPolicy` (owner, not deleted and active, checked in the statement; strict schema; audit in the same batch).
+  A new policy key is added as optional.
+- **Routes** (`routes/admin/compute.ts`) and **CLI** (`nemar admin compute policy|pool`): errors are `{ error, code }` with the words and statuses of `shared/contract/compute-admin.ts`, whose response schemas are open.
+  Interim owner rule, easy to loosen: an administrator corrects an account's grant, and only an owner corrects its charge or a platform budget.
+  The budget semantics of a charge correction and of a refund are the repository owner's decision: option A, the `people` budget records consumption only and a refund or a correction moves the person's pool alone; option B, they also credit the budget back.
+  Today's code is option B (both move the budget with the pool), and choosing option A changes the code, not the migration.
+  `frozen` has no writer yet: whoever suspends access (phase D, A8) sets it, and a hold reads it (the holder's own pool; a frozen budget pool does not refuse a hold).
+- **Not here**: the job table, the job-count guards on a hold (phase A3), the callers of settle (phases A5 and A7), automatic renewal and the default grant at approval (Epic D), mail.
