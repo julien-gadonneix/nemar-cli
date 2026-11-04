@@ -39,11 +39,16 @@
 
 import { z } from "zod";
 import {
+  COMPUTE_ARGS_DESCRIPTION,
+  COMPUTE_COMMAND_DESCRIPTION,
   COMPUTE_DATASET_ID_RE,
-  COMPUTE_DATASET_VERSION_RE,
+  COMPUTE_DATA_TAG_MAX,
+  COMPUTE_DATA_TAG_RE,
   COMPUTE_DOT_SEGMENT_RE,
+  COMPUTE_ENTRY_DESCRIPTION,
   COMPUTE_IMAGE_DIGEST_RE,
   COMPUTE_IMAGE_REF_RE,
+  COMPUTE_INCLUDE_DESCRIPTION,
   COMPUTE_JOB_ID_RE,
   COMPUTE_MAX_OUTPUT_FILES,
   COMPUTE_PATH_SEGMENT,
@@ -56,6 +61,7 @@ import {
   computeGlobSchema,
   computePathSchema,
   computeSafeInt,
+  dataTagForVersion,
   isSafeComputePath,
 } from "./compute.js";
 
@@ -79,11 +85,18 @@ const API_BASE_RE = /^https?:\/\/[^\s/?#][^\s?#]*$/;
 const URL_RE = /^https?:\/\/[^\s]+$/;
 const JOB_TOKEN_RE = /^[A-Za-z0-9_-]{16,256}$/;
 /**
- * A Singularity image file on the node: a relative path of non-empty segments of letters, digits and
- * `._+-`, never starting with `-` (so it cannot read as an option), with no `.` or `..` segment, no
- * leading or trailing `/` and no control character.
+ * The Singularity image file on the node: exactly `<64 lowercase hex>.sif`, a basename with no
+ * directory, relative to `NEMAR_SIF_ROOT` (`LAUNCHER_ENV.SIF_ROOT`). It is the file name of the SIF
+ * built from the image's digest, so it is also the digest's hex plus `.sif`: see
+ * {@link sifFileNameForDigest}.
  */
-const SIF_RE = /^(?!-)[A-Za-z0-9_.+-]+(?:\/[A-Za-z0-9_.+-]+)*$/;
+const SIF_FILE_RE = /^[0-9a-f]{64}\.sif$/;
+/** What the entry and command descriptions add in the launch specification. */
+const EXACTLY_ONE = " Exactly one of entry and command is present.";
+const SIF_FORM_MESSAGE = "the image file is not <64 lowercase hex>.sif";
+const SIF_NAMED_MESSAGE = "the image file is not the one named for the image digest";
+const IMAGE_REF_FORM_MESSAGE = "the image reference is not a digest-pinned reference";
+const IMAGE_REF_NAMED_MESSAGE = "the image reference is not pinned to the image digest";
 /** UTC, as the presigning calls write it; the shape is checked, not the calendar. */
 const TIMESTAMP_RE = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?Z$/;
 /** Where an upload goes under `jobs/<id>/`: an output, or one of the four launcher files. */
@@ -112,11 +125,16 @@ export const LaunchSpecSchema = z
     /** The NEMAR job id, which is also the prefix of the job's keys. */
     job_id: z.string().regex(COMPUTE_JOB_ID_RE),
     runtime: z.enum(LAUNCH_RUNTIMES),
-    /** A path inside the bundle. */
-    entry: relativePath(240).optional(),
-    /** An argument vector for an image job, run as given. */
-    command: z.array(z.string().min(1).max(1024)).min(1).max(64).optional(),
-    args: z.array(z.string().max(1024)).max(64),
+    entry: relativePath(240)
+      .optional()
+      .describe(COMPUTE_ENTRY_DESCRIPTION + EXACTLY_ONE),
+    command: z
+      .array(z.string().min(1).max(1024))
+      .min(1)
+      .max(64)
+      .optional()
+      .describe(COMPUTE_COMMAND_DESCRIPTION + EXACTLY_ONE),
+    args: z.array(z.string().max(1024)).max(64).describe(COMPUTE_ARGS_DESCRIPTION),
     /** The archive's own digest and size; the launcher is given no URL and asks the Worker. */
     bundle: z
       .object({ sha256: z.string().regex(COMPUTE_SHA256_RE), size: safeInt(1) })
@@ -127,8 +145,18 @@ export const LaunchSpecSchema = z
         z
           .object({
             id: z.string().regex(COMPUTE_DATASET_ID_RE),
-            version: z.string().regex(COMPUTE_DATASET_VERSION_RE),
-            include: z.array(computeGlobSchema).max(64).optional(),
+            /**
+             * The data-plane tag: `latest` or `v<major>.<minor>.<patch>`. A job names a version more
+             * loosely (`1.0.2`); the Worker writes the tag with `dataTagForVersion` (`1.0.2` becomes
+             * `v1.0.2`) and refuses a job whose version has none, naming `datasetVersionWithoutTag`'s
+             * field, before the hold.
+             */
+            version: z.string().max(COMPUTE_DATA_TAG_MAX).regex(COMPUTE_DATA_TAG_RE),
+            include: z
+              .array(computeGlobSchema)
+              .max(64)
+              .optional()
+              .describe(COMPUTE_INCLUDE_DESCRIPTION),
           })
           .strict(),
       )
@@ -137,15 +165,24 @@ export const LaunchSpecSchema = z
     api_base: z.string().max(512).regex(API_BASE_RE),
     image: z
       .object({
-        /** A digest-pinned reference, as a job's own `image` is: no leading `-`, no control character. */
-        uri: z.string().max(512).regex(COMPUTE_IMAGE_REF_RE),
+        /**
+         * A digest-pinned reference, as a job's own `image` is: no leading `-`, no control character.
+         * The `@sha256:<hex>` it ends with is the one in `digest`: a rule the JSON Schema cannot
+         * express and the refinement below enforces, because `digest` names the file that runs and
+         * the provenance records it as the image's.
+         */
+        uri: z.string().max(512).regex(COMPUTE_IMAGE_REF_RE, IMAGE_REF_FORM_MESSAGE),
         digest: z.string().regex(COMPUTE_IMAGE_DIGEST_RE),
-        /** The Singularity image file on the node that the launcher runs. */
-        sif: z
-          .string()
-          .max(256)
-          .regex(SIF_RE)
-          .refine((p) => !COMPUTE_DOT_SEGMENT_RE.test(p), { message: "no . or .. segments" }),
+        /**
+         * The Singularity image file the launcher runs: `<64 lowercase hex>.sif`, a basename relative
+         * to `NEMAR_SIF_ROOT`, which the launcher requires (it has no fallback and ends
+         * `image_missing` when it is unset). The hex is the one in `digest`: a rule the JSON Schema
+         * cannot express and the refinement below enforces (NEMAR's encoder refuses a document that
+         * breaks it, so every launch specification NEMAR hands the launcher satisfies it). The file's
+         * content hash is NOT verified by the launcher: the name is all that ties the file to the
+         * digest.
+         */
+        sif: z.string().regex(SIF_FILE_RE, SIF_FORM_MESSAGE),
       })
       .strict(),
     env: launchEnvSchema,
@@ -164,9 +201,40 @@ export const LaunchSpecSchema = z
     if (spec.entry !== undefined && spec.bundle === undefined) {
       refuse("bundle", "an entry needs the bundle that holds it");
     }
+    // Each cross rule only when both its fields are well formed, so the field issues are not doubled.
+    const named = sifFileNameForDigest(spec.image.digest);
+    if (named !== null && SIF_FILE_RE.test(spec.image.sif) && spec.image.sif !== named) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["image", "sif"],
+        message: SIF_NAMED_MESSAGE,
+      });
+    }
+    if (
+      named !== null &&
+      COMPUTE_IMAGE_REF_RE.test(spec.image.uri) &&
+      !spec.image.uri.endsWith(spec.image.digest)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["image", "uri"],
+        message: IMAGE_REF_NAMED_MESSAGE,
+      });
+    }
   });
 
 export type LaunchSpec = z.infer<typeof LaunchSpecSchema>;
+
+/**
+ * The file name of the SIF built from an image digest: `<the 64 hex of "sha256:<hex>">.sif`, or null
+ * for anything that is not such a digest. It is the one rule that ties `image.sif` to
+ * `image.digest`, which a JSON Schema cannot express: the Worker builds `image.sif` with it, and
+ * `LaunchSpecSchema` refuses a document where the two disagree. Pure.
+ */
+export function sifFileNameForDigest(digest: string): string | null {
+  if (typeof digest !== "string" || !COMPUTE_IMAGE_DIGEST_RE.test(digest)) return null;
+  return `${digest.slice("sha256:".length)}.sif`;
+}
 
 /**
  * Every UTF-16 code unit at or above U+007F as a lowercase `\uXXXX` escape. JSON allows non-ASCII
@@ -202,11 +270,16 @@ export function encodeLaunchSpec(spec: unknown): string {
 
 /**
  * Whether a job specification, once a Worker has added everything it supplies, encodes within the
- * 64 KiB the launcher reads. The Worker's fields are taken at their worst case (a 512-character
- * `api_base` and image reference, a 256-character `sif` and token, the largest bundle and limits),
- * so a true answer holds whatever the Worker puts there. A specification that passes
- * `JobSpecSchema` always fits; this is for the Worker to refuse with `invalid_spec`, before it takes
- * a hold, one that was built some other way. Pure; never throws.
+ * 64 KiB the launcher reads, with each dataset version written as its data-plane tag
+ * ({@link dataTagForVersion}); a job whose dataset version has no tag is false. The Worker's fields
+ * are taken at their worst case (a 512-character `api_base` and image reference, a 256-character
+ * token, the 68-character image file name, the largest bundle and limits), so a true answer holds
+ * whatever the Worker puts there.
+ *
+ * A valid job specification always fits the 64 KiB and is well formed; the dataset version tag is
+ * the one launch rule JobSpecSchema does not enforce, so the Worker and the CLI must run
+ * `launchSpecFits` (and refuse with `invalid_spec`, naming the field {@link datasetVersionWithoutTag}
+ * finds) BEFORE the hold. It also catches a specification built some other way. Pure; never throws.
  */
 export function launchSpecFits(job: JobSpec): boolean {
   const hex = "f".repeat(64);
@@ -216,9 +289,14 @@ export function launchSpecFits(job: JobSpec): boolean {
     runtime: job.runtime === "image" ? "image" : "python",
     args: job.args,
     bundle: { sha256: hex, size: Number.MAX_SAFE_INTEGER },
-    datasets: job.datasets.map((d) => ({ id: d.id, version: d.version, include: d.include })),
+    // A version with no data-plane tag is null here, which the document refuses: not launchable.
+    datasets: job.datasets.map((d) => ({
+      id: d.id,
+      version: dataTagForVersion(d.version),
+      include: d.include,
+    })),
     api_base: `https://${"a".repeat(504)}`,
-    image: { uri, digest: `sha256:${hex}`, sif: "s".repeat(256) },
+    image: { uri, digest: `sha256:${hex}`, sif: `${hex}.sif` },
     env: job.env,
     resources: { gpus: job.gpus },
     limits: { max_files: 1_000_000, max_total_bytes: Number.MAX_SAFE_INTEGER },

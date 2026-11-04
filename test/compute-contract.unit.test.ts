@@ -22,8 +22,16 @@ import { createHash } from "node:crypto";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Ajv2020 } from "ajv/dist/2020";
+import type { z } from "zod";
 import { LAUNCHER_FAILURE_CODES } from "../shared/compute-state";
 import {
+  COMPUTE_ARGS_DESCRIPTION,
+  COMPUTE_COMMAND_DESCRIPTION,
+  COMPUTE_DATASET_VERSION_RE,
+  COMPUTE_DATA_TAG_MAX,
+  COMPUTE_DATA_TAG_RE,
+  COMPUTE_ENTRY_DESCRIPTION,
+  COMPUTE_INCLUDE_DESCRIPTION,
   COMPUTE_JOB_ID_RE,
   COMPUTE_MAX_OUTPUT_FILES,
   COMPUTE_PATH_SEGMENT,
@@ -54,8 +62,11 @@ import {
   RESULT_MAX_FILE_BYTES,
   ResultManifestSchema,
   computeIsWellFormed,
+  dataTagForVersion,
+  datasetVersionWithoutTag,
   estimateSuMilli,
   formatSu,
+  includePatternProblem,
   isSafeComputePath,
   launchStringBytes,
   launchVariableBytes,
@@ -74,6 +85,7 @@ import {
   launchSpecFits,
   resultsLauncherKey,
   resultsOutputKey,
+  sifFileNameForDigest,
 } from "../shared/contract/compute-launch";
 import launchSchema from "../shared/contract/compute-launch.schema.json";
 import * as contractIndex from "../shared/contract/index";
@@ -1183,6 +1195,402 @@ describe("the job specification", () => {
   });
 });
 
+describe("the data-plane tag of a dataset version", () => {
+  test("a bare version gains a v, a tag and latest stay as they are", () => {
+    expect(dataTagForVersion("1.0.2")).toBe("v1.0.2");
+    expect(dataTagForVersion("v1.0.2")).toBe("v1.0.2");
+    expect(dataTagForVersion("latest")).toBe("latest");
+    expect(dataTagForVersion("0.0.0")).toBe("v0.0.0");
+    expect(dataTagForVersion("10.200.3000")).toBe("v10.200.3000");
+    expect(dataTagForVersion("v10.200.3000")).toBe("v10.200.3000");
+    expect(dataTagForVersion("01.02.03")).toBe("v01.02.03");
+    expect(dataTagForVersion("v01.02.03")).toBe("v01.02.03");
+  });
+
+  test("anything else has no tag", () => {
+    for (const bad of [
+      "",
+      "1",
+      "1.0",
+      "v1",
+      "v1.0",
+      "1.0.2.3",
+      "v1.0.2.3",
+      "V1.0.2",
+      "Latest",
+      "LATEST",
+      "latest ",
+      " latest",
+      "latest\n",
+      "latest1",
+      "vlatest",
+      "1.0.2\n",
+      "v1.0.2\n",
+      " 1.0.2",
+      "1.0.2 ",
+      "1.0.2-rc1",
+      "v1.0.2-rc1",
+      "1.0.2+b",
+      "vv1.0.2",
+      "1.0.a",
+      "1x0.2",
+      "1.0x2",
+      "v1x0.2",
+      "v1.0x2",
+      "1..2",
+      "1.0.",
+      ".1.2",
+      "v",
+      "main",
+      "abc",
+      "../1.0.2",
+      "1.0.2/x",
+      "١.٠.٢",
+      "v١.٠.٢",
+    ]) {
+      expect(dataTagForVersion(bad), JSON.stringify(bad)).toBeNull();
+    }
+    for (const bad of [5, null, undefined, {}, ["1.0.2"], { toString: () => "1.0.2" }]) {
+      expect(dataTagForVersion(bad as never), String(bad)).toBeNull();
+    }
+  });
+
+  test("the longest tag is 64 characters, and one more is no tag", () => {
+    const sixtyFour = `v${"9".repeat(59)}.0.0`;
+    expect(sixtyFour.length).toBe(64);
+    expect(dataTagForVersion(sixtyFour)).toBe(sixtyFour);
+    // A bare version of 63 characters gains the v and is 64; one of 64 would be 65, which is no tag.
+    const bare = `${"9".repeat(59)}.0.0`;
+    expect(bare.length).toBe(63);
+    expect(dataTagForVersion(bare)).toBe(sixtyFour);
+    const bareSixtyFour = `${"9".repeat(60)}.0.0`;
+    expect(bareSixtyFour.length).toBe(64);
+    expect(dataTagForVersion(bareSixtyFour)).toBeNull();
+    expect(dataTagForVersion(`${sixtyFour}0`)).toBeNull();
+    expect(dataTagForVersion(`v${"9".repeat(60)}.0.0`)).toBeNull();
+    // Such a job version is valid for a job, and is the tag helper's null: see datasetVersionWithoutTag.
+    expect(specRefused(specWith({ datasets: [{ id: "nm000104", version: bareSixtyFour }] }))).toBe(
+      false,
+    );
+    expect(COMPUTE_DATA_TAG_MAX).toBe(64);
+  });
+
+  test("every tag the helper can return is a version the provenance staging record accepts", () => {
+    // The launcher records the tag it fetched in staging[].version, which the Worker parses strictly:
+    // a tag longer than that field allows would make a good run's provenance a refused file.
+    const staged = (version: string) => ({
+      ...PROVENANCE_BASE,
+      staging: [{ ...STAGING, version }],
+    });
+    const tags = new Set<string>(["latest", "v0.0.0", "v1.0.2", "v01.02.03", "v10.200.3000"]);
+    // Every length a tag of the form v<digits>.0.0 can have, from its shortest to its longest, as a
+    // bare job version and as the tag a job may name itself.
+    for (let n = 1; n <= 80; n++) {
+      for (const version of [
+        `${"9".repeat(n)}.0.0`,
+        `v${"9".repeat(n)}.0.0`,
+        `${"9".repeat(n)}.${"8".repeat(n)}.7`,
+      ]) {
+        const tag = dataTagForVersion(version);
+        if (tag !== null) tags.add(tag);
+      }
+    }
+    expect(tags.size).toBeGreaterThan(80);
+    let longest = 0;
+    for (const tag of tags) {
+      expect(tag.length, tag).toBeLessThanOrEqual(COMPUTE_DATA_TAG_MAX);
+      expect(COMPUTE_DATASET_VERSION_RE.test(tag), `pattern: ${tag}`).toBe(true);
+      expect(ajvFor("provenance")(staged(tag)), `JSON Schema: ${tag}`).toBe(true);
+      expect(zodFor.provenance(staged(tag)), `zod: ${tag}`).toBe(true);
+      longest = Math.max(longest, tag.length);
+    }
+    expect(longest).toBe(COMPUTE_DATA_TAG_MAX);
+    // And the field really does stop where the tag does: one character more is refused there.
+    const tooLong = `v${"9".repeat(60)}.0.0`;
+    expect(tooLong.length).toBe(COMPUTE_DATA_TAG_MAX + 1);
+    expect(ajvFor("provenance")(staged(tooLong))).toBe(false);
+    expect(zodFor.provenance(staged(tooLong))).toBe(false);
+  });
+
+  test("it is idempotent: the tag of a tag is the tag", () => {
+    for (const v of ["1.0.2", "v1.0.2", "latest", "0.0.0", "12.0.1"]) {
+      const tag = dataTagForVersion(v);
+      expect(tag, v).not.toBeNull();
+      expect(dataTagForVersion(tag as string), v).toBe(tag);
+    }
+  });
+
+  test("a tag is exactly what the launch specification accepts, in both engines", () => {
+    const versions = [
+      "1.0.2",
+      "v1.0.2",
+      "latest",
+      "0.0.0",
+      "1",
+      "1.0",
+      "v1",
+      "V1.0.2",
+      "1.0.2-rc1",
+      "latest1",
+      "",
+      "abc",
+      `${"9".repeat(59)}.0.0`,
+      `${"9".repeat(60)}.0.0`,
+      `v${"9".repeat(59)}.0.0`,
+      `v${"9".repeat(60)}.0.0`,
+      "1.0.2\n",
+    ];
+    const withVersion = (version: string) => set(LAUNCH, "datasets", [{ id: "nm000104", version }]);
+    for (const version of versions) {
+      const tag = dataTagForVersion(version);
+      if (tag !== null) {
+        expect(validateRoot(withVersion(tag)), `JSON Schema: ${version}`).toBe(true);
+        expect(LaunchSpecSchema.safeParse(withVersion(tag)).success, `zod: ${version}`).toBe(true);
+      } else {
+        // No tag: the version as it stands is no launch version either.
+        expect(validateRoot(withVersion(version)), `JSON Schema: ${version}`).toBe(false);
+        expect(LaunchSpecSchema.safeParse(withVersion(version)).success, `zod: ${version}`).toBe(
+          false,
+        );
+      }
+    }
+  });
+
+  test("the tag grammar is the data plane's own: latest, or what VERSION_TAG_RE accepts", () => {
+    // Read from the data plane's source, so a change there fails here. `\\d` is ASCII digits only.
+    const source = readFileSync(
+      join(import.meta.dir, "..", "backend", "src", "services", "data-router.ts"),
+      "utf8",
+    );
+    const found = /export const VERSION_TAG_RE = \/(.+)\/;/.exec(source);
+    expect(found, "VERSION_TAG_RE is still declared in data-router.ts").not.toBeNull();
+    const dataPlane = new RegExp((found as RegExpExecArray)[1]);
+    const corpus = [
+      "v1.0.2",
+      "v0.0.0",
+      "v10.200.3000",
+      "v01.02.03",
+      "latest",
+      "1.0.2",
+      "v1",
+      "v1.0",
+      "v1.0.2.3",
+      "V1.0.2",
+      "v1.0.2\n",
+      "v1.0.2-rc1",
+      " v1.0.2",
+      "v\u0661.\u0660.\u0662",
+      "",
+      "main",
+      `v${"9".repeat(60)}.0.0`,
+    ];
+    for (const version of corpus) {
+      // The data plane resolves `latest` before it applies the pattern, so it is the one extra word.
+      const dataPlaneAccepts = version === "latest" || dataPlane.test(version);
+      expect(COMPUTE_DATA_TAG_RE.test(version), JSON.stringify(version)).toBe(dataPlaneAccepts);
+    }
+    expect(COMPUTE_DATA_TAG_MAX).toBe(64);
+  });
+
+  test("a job keeps accepting every version form it accepted before", () => {
+    for (const version of ["1.0.2", "v1.0.2", "latest", "1", "1.0", "2.0.0-rc.1", "abc", "V1"]) {
+      expect(specRefused(specWith({ datasets: [{ id: "nm000104", version }] })), version).toBe(
+        false,
+      );
+    }
+  });
+});
+
+describe("the one launch rule a job specification does not enforce: the dataset version tag", () => {
+  // A valid job specification always fits the 64 KiB and is well formed. A dataset version with no
+  // data-plane tag is valid for a job and has no tag, so the Worker and the CLI run launchSpecFits
+  // before the hold and refuse with invalid_spec, naming the field datasetVersionWithoutTag finds.
+  const UNTAGGED = ["1", "1.0", "abc", "V1.0.2", "2.0.0-rc.1", "1.0.2-rc1", "v1", "1.x.2"];
+
+  test("every such version is a valid job and has no tag", () => {
+    for (const version of UNTAGGED) {
+      const job = specWith({ datasets: [{ id: "nm000104", version }] });
+      expect(specRefused(job), `job: ${version}`).toBe(false);
+      expect(dataTagForVersion(version), `tag: ${version}`).toBeNull();
+      expect(launchSpecFits(JobSpecSchema.parse(job)), `fits: ${version}`).toBe(false);
+    }
+  });
+
+  test("datasetVersionWithoutTag names the first dataset whose version has no tag", () => {
+    const at = (versions: string[]) =>
+      datasetVersionWithoutTag(versions.map((version) => ({ id: "nm000104", version })));
+    expect(at(["1"])).toBe("datasets.0.version");
+    expect(at(["1.0.2", "abc"])).toBe("datasets.1.version");
+    expect(at(["v1.0.2", "latest", "1.0.2", "1.0"])).toBe("datasets.3.version");
+    // The first, when there are several.
+    expect(at(["1.0.2", "x", "y", "z"])).toBe("datasets.1.version");
+    expect(at(["x", "y"])).toBe("datasets.0.version");
+    for (const version of UNTAGGED)
+      expect(at(["1.0.2", version]), version).toBe("datasets.1.version");
+  });
+
+  test("it is null when every version has a tag, and when there are no datasets", () => {
+    expect(datasetVersionWithoutTag([])).toBeNull();
+    expect(datasetVersionWithoutTag([{ version: "1.0.2" }])).toBeNull();
+    expect(
+      datasetVersionWithoutTag([
+        { version: "v1.0.2" },
+        { version: "latest" },
+        { version: "0.0.0" },
+      ]),
+    ).toBeNull();
+  });
+
+  test("it is the same answer as launchSpecFits gives, for the tag", () => {
+    for (const version of ["1.0.2", "v1.0.2", "latest", ...UNTAGGED]) {
+      const job = JobSpecSchema.parse(specWith({ datasets: [{ id: "nm000104", version }] }));
+      expect(datasetVersionWithoutTag(job.datasets) === null, version).toBe(launchSpecFits(job));
+    }
+  });
+
+  test("the invariant is stated the same way, and no sentence claims a valid job always becomes a launch specification", () => {
+    const read = (...parts: string[]) =>
+      readFileSync(join(import.meta.dir, "..", ...parts), "utf8")
+        .replace(/\n\s*\*\s?/g, " ")
+        .replace(/\s+/g, " ");
+    const statement =
+      "the dataset version tag is the one launch rule JobSpecSchema does not enforce";
+    for (const text of [
+      read("shared", "contract", "compute.ts"),
+      read("shared", "contract", "compute-launch.ts"),
+      read(".context", "compute-program", "implementation-notes.md"),
+    ]) {
+      expect(text).toContain(statement);
+      expect(text).toContain("must run `launchSpecFits`");
+      expect(text).toContain("BEFORE the hold");
+      expect(text).not.toContain("A valid specification always becomes a launch specification");
+      expect(text).not.toContain("a valid job specification always fits.");
+    }
+  });
+});
+
+describe("the include dialect's refused patterns", () => {
+  test("includePatternProblem accepts every pattern the dialect accepts, edges included", () => {
+    for (const ok of [
+      "",
+      "*",
+      "**",
+      "?",
+      "**/x",
+      "a/**/b",
+      "**/*.set",
+      "sub-*/eeg/*.set",
+      "*.set",
+      // An unterminated [ is a literal [.
+      "[",
+      "a[",
+      "[abc",
+      "[!",
+      "[!abc",
+      "x[y",
+      "a/[b",
+      // Classes, and the hyphen at either end or after a range as a literal.
+      "[abc]",
+      "[a-c]",
+      "[!abc]",
+      "[!a-c]",
+      "[0-9a-f]x",
+      "[a-]",
+      "[-a]",
+      "[a-a]",
+      "[--/]",
+      "[a-c-e]",
+      "[a-c-a]",
+      "[cba]",
+      "[zyx]",
+      "[[]",
+      "[a[b]",
+      "[ab]]",
+      // Code points, not UTF-16 units: an astral range is a range.
+      "[\u{1F600}-\u{1F603}]",
+      "[\u{1F600}-\u{1F600}]",
+      "[é-ÿ]",
+    ]) {
+      expect(includePatternProblem(ok), JSON.stringify(ok)).toBeNull();
+    }
+  });
+
+  test("an empty class is refused as empty_class, a [ or [! with a ] straight after it", () => {
+    for (const bad of ["[]", "[!]", "a[]b", "x/[]/y", "[]]", "[]a]", "[!]a]", "*[]", "[a][]"]) {
+      expect(includePatternProblem(bad), JSON.stringify(bad)).toBe("empty_class");
+    }
+  });
+
+  test("an inverted range is refused as inverted_range", () => {
+    for (const bad of [
+      "[z-a]",
+      "[b-a]",
+      "[9-0]",
+      "[!z-a]",
+      "x[a-c][z-a]",
+      "[a-cz-a]",
+      "[xb-a]",
+      "[a-!]",
+      "[\u{1F603}-\u{1F600}]",
+      "[ÿ-é]",
+      "[~- ]",
+    ]) {
+      expect(includePatternProblem(bad), JSON.stringify(bad)).toBe("inverted_range");
+    }
+  });
+
+  test("the first problem found, left to right, is the one named", () => {
+    expect(includePatternProblem("[][z-a]")).toBe("empty_class");
+    expect(includePatternProblem("[z-a][]")).toBe("inverted_range");
+  });
+
+  test("a class ends at the first ], so what follows is a literal or another class", () => {
+    expect(includePatternProblem("[a-c][z-a")).toBeNull(); // the second [ is unterminated
+    expect(includePatternProblem("[a]z-a]")).toBeNull(); // z-a] is outside any class
+    expect(includePatternProblem("[a-c]]")).toBeNull();
+    expect(includePatternProblem("[a-c][b-a]")).toBe("inverted_range");
+  });
+
+  test("a job refuses such a pattern at submit, naming datasets.<i>.include.<j> and never the pattern", () => {
+    const withInclude = (include: string[]) =>
+      specWith({
+        datasets: [
+          { id: "nm000104", version: "1.0.2" },
+          { id: "nm000105", version: "1.0.2", include },
+        ],
+      });
+    const refusal = (include: string[]) => {
+      const refused = JobSpecSchema.safeParse(withInclude(include));
+      return refused.success ? [] : refused.error.issues;
+    };
+    const [empty] = refusal(["ok/*", "x", "ab[]cd"]);
+    expect(refusal(["ok/*", "x", "ab[]cd"])).toHaveLength(1);
+    expect(empty.path).toEqual(["datasets", 1, "include", 2]);
+    expect(empty.message).toContain("empty_class");
+    expect(empty.message).not.toContain("ab[]cd");
+    const [inverted] = refusal(["[z-a]"]);
+    expect(refusal(["[z-a]"])).toHaveLength(1);
+    expect(inverted.path).toEqual(["datasets", 1, "include", 0]);
+    expect(inverted.message).toContain("inverted_range");
+    // Each bad pattern gets its own issue, at its own place.
+    expect(refusal(["[]", "fine", "[z-a]"]).map((i) => i.path.join("."))).toEqual([
+      "datasets.1.include.0",
+      "datasets.1.include.2",
+    ]);
+    for (const ok of ["**/x", "a/**/b", "[", "[!", "[a-]", "[abc", "**"]) {
+      expect(specRefused(withInclude([ok])), ok).toBe(false);
+    }
+  });
+
+  test("the launch specification is as permissive: the launcher alone refuses these, as bad_include", () => {
+    const launch = set(LAUNCH, "datasets", [
+      { id: "nm000104", version: "v1.0.2", include: ["[]", "[z-a]"] },
+    ]);
+    expect(validateRoot(launch)).toBe(true);
+    expect(LaunchSpecSchema.safeParse(launch).success).toBe(true);
+  });
+});
+
 describe("isSafeComputePath", () => {
   test("accepts ordinary relative paths and refuses every escape", () => {
     for (const ok of ["a", "a/b", "a b/c.d", "sub-01/eeg/x.set", "..a", "a..b", ".hidden"]) {
@@ -1271,6 +1679,7 @@ describe("the launcher contract", () => {
       OUT: "NEMAR_OUT",
       LOCAL_DATASETS_ROOT: "NEMAR_LOCAL_DATASETS_ROOT",
       HOST_PYTHON: "NEMAR_HOST_PYTHON",
+      SIF_ROOT: "NEMAR_SIF_ROOT",
     });
   });
 
@@ -1411,12 +1820,12 @@ const LAUNCH = {
   entry: "run.py",
   args: ["--fast"],
   bundle: { sha256: HEX_A, size: 1234 },
-  datasets: [{ id: "nm000104", version: "1.0.2" }],
+  datasets: [{ id: "nm000104", version: "v1.0.2" }],
   api_base: "https://api.example.test",
   image: {
     uri: `docker://ghcr.io/example/runtime@sha256:${HEX_B}`,
     digest: `sha256:${HEX_B}`,
-    sif: "runtime.sif",
+    sif: `${HEX_B}.sif`,
   },
   env: { OMP_NUM_THREADS: "4" },
   resources: { gpus: 0 },
@@ -1486,7 +1895,7 @@ const LAUNCH_CASES: readonly Case[] = [
   ["no env", set(LAUNCH, "env", {}), true],
   [
     "an include pattern",
-    set(LAUNCH, "datasets", [{ id: "nm000104", version: "1.0.2", include: ["sub-01/**/*.set"] }]),
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2", include: ["sub-01/**/*.set"] }]),
     true,
   ],
   ["gpus 4", set(LAUNCH, "resources.gpus", 4), true],
@@ -1495,7 +1904,6 @@ const LAUNCH_CASES: readonly Case[] = [
   ["a hex job token", set(LAUNCH, "job_token", "ab".repeat(32)), true],
   ["a nested entry", set(LAUNCH, "entry", "src/analysis/run.py"), true],
   ["an entry of 240 characters", set(LAUNCH, "entry", `${"a".repeat(237)}.py`), true],
-  ["a sif in a directory", set(LAUNCH, "image.sif", "images/runtime-1.2.sif"), true],
 
   ["an unknown top-level key", { ...LAUNCH, upload: {} }, false],
   // A trailing newline is the one input `$` lets Python's `re` accept and JavaScript's refuse; the
@@ -1512,17 +1920,16 @@ const LAUNCH_CASES: readonly Case[] = [
   ],
   [
     "a dataset id with a trailing newline",
-    set(LAUNCH, "datasets", [{ id: "nm000104\n", version: "1" }]),
+    set(LAUNCH, "datasets", [{ id: "nm000104\n", version: "v1.0.2" }]),
     false,
   ],
-  ["a sif with a trailing newline", set(LAUNCH, "image.sif", "runtime.sif\n"), false],
   ["a bundle url", set(LAUNCH, "bundle.url", "https://x.test/b.tar.gz"), false],
   ["an unknown image key", set(LAUNCH, "image.extra", 1), false],
   ["an unknown limits key", set(LAUNCH, "limits.extra", 1), false],
   ["an unknown resources key", set(LAUNCH, "resources.cores", 4), false],
   [
     "an unknown dataset key",
-    set(LAUNCH, "datasets", [{ id: "nm000104", version: "1", x: 1 }]),
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2", x: 1 }]),
     false,
   ],
   ["runtime matlab", set(LAUNCH, "runtime", "matlab"), false],
@@ -1541,10 +1948,6 @@ const LAUNCH_CASES: readonly Case[] = [
   ["an entry with a dot segment", set(LAUNCH, "entry", "a/./b.py"), false],
   ["an empty entry", set(LAUNCH, "entry", ""), false],
   ["an entry of 241 characters", set(LAUNCH, "entry", `${"a".repeat(238)}.py`), false],
-  ["a sif with a space", set(LAUNCH, "image.sif", "runtime image.sif"), false],
-  ["a sif with a backslash", set(LAUNCH, "image.sif", "a\\b.sif"), false],
-  ["an empty sif", set(LAUNCH, "image.sif", ""), false],
-  ["a sif of 257 characters", set(LAUNCH, "image.sif", "s".repeat(257)), false],
   ["a bundle digest in capitals", set(LAUNCH, "bundle.sha256", "A".repeat(64)), false],
   ["a short bundle digest", set(LAUNCH, "bundle.sha256", "a".repeat(63)), false],
   ["a zero-size bundle", set(LAUNCH, "bundle.size", 0), false],
@@ -1704,43 +2107,164 @@ const LAUNCH_CASES: readonly Case[] = [
     ),
     false,
   ],
+  // The image file is exactly `<64 lowercase hex>.sif`, a basename relative to NEMAR_SIF_ROOT.
   [
-    "a sif in a directory with dots and plus",
-    set(LAUNCH, "image.sif", "images/rt-1.2+b.sif"),
+    "an image of another digest, with its own sif",
+    set(
+      set(set(LAUNCH, "image.digest", `sha256:${HEX_A}`), "image.sif", `${HEX_A}.sif`),
+      "image.uri",
+      `docker://ghcr.io/example/runtime@sha256:${HEX_A}`,
+    ),
     true,
   ],
-  ["a sif that starts with a dot", set(LAUNCH, "image.sif", ".hidden.sif"), true],
-  ["a sif that starts with a dash", set(LAUNCH, "image.sif", "-runtime.sif"), false],
-  ["a sif that is only a dash", set(LAUNCH, "image.sif", "-"), false],
-  ["a sif with a dash after the start", set(LAUNCH, "image.sif", "a-b.sif"), true],
-  ["a sif in a directory that starts with a dash", set(LAUNCH, "image.sif", "dir/-x.sif"), true],
-  ["an absolute sif", set(LAUNCH, "image.sif", "/opt/rt.sif"), false],
-  ["a sif that climbs", set(LAUNCH, "image.sif", "../rt.sif"), false],
-  ["a sif that climbs from inside", set(LAUNCH, "image.sif", "a/../rt.sif"), false],
-  ["a sif that is a dot segment", set(LAUNCH, "image.sif", "a/./rt.sif"), false],
-  ["a sif that is only two dots", set(LAUNCH, "image.sif", ".."), false],
-  ["a sif with an empty segment", set(LAUNCH, "image.sif", "a//rt.sif"), false],
-  ["a sif with a trailing slash", set(LAUNCH, "image.sif", "images/"), false],
-  ["a sif with a control character", set(LAUNCH, "image.sif", "a\u0001b.sif"), false],
-  ["a sif with a newline in it", set(LAUNCH, "image.sif", "a\nb.sif"), false],
-  ["a sif with a DEL", set(LAUNCH, "image.sif", "a\u007fb.sif"), false],
-  ["a sif with a backslash", set(LAUNCH, "image.sif", "a\\b.sif"), false],
-  ["a sif with non-ASCII", set(LAUNCH, "image.sif", "caf\u00e9.sif"), false],
+  ["the old fixed sif name", set(LAUNCH, "image.sif", "runtime.sif"), false],
+  ["a sif in a directory", set(LAUNCH, "image.sif", `images/${HEX_B}.sif`), false],
+  ["a sif with capitals in the hash", set(LAUNCH, "image.sif", `${"B".repeat(64)}.sif`), false],
+  ["a sif of 63 hex digits", set(LAUNCH, "image.sif", `${"b".repeat(63)}.sif`), false],
+  ["a sif of 65 hex digits", set(LAUNCH, "image.sif", `${"b".repeat(65)}.sif`), false],
+  ["a sif with a non-hex digit", set(LAUNCH, "image.sif", `g${"b".repeat(63)}.sif`), false],
+  ["a sif that is only the hash", set(LAUNCH, "image.sif", HEX_B), false],
+  ["a sif with a capital suffix", set(LAUNCH, "image.sif", `${HEX_B}.SIF`), false],
+  ["a sif with a doubled suffix", set(LAUNCH, "image.sif", `${HEX_B}.sif.sif`), false],
+  ["a sif with a longer suffix", set(LAUNCH, "image.sif", `${HEX_B}.sifx`), false],
+  ["a sif whose dot is another character", set(LAUNCH, "image.sif", `${HEX_B}xsif`), false],
+  ["a sif whose dot is a dash", set(LAUNCH, "image.sif", `${HEX_B}-sif`), false],
+  ["a sif with a leading dash", set(LAUNCH, "image.sif", `-${HEX_B}.sif`), false],
+  ["a sif that is only a suffix", set(LAUNCH, "image.sif", ".sif"), false],
+  ["a sif with a trailing newline", set(LAUNCH, "image.sif", `${HEX_B}.sif\n`), false],
+  [
+    "a sif with a newline in the hash",
+    set(LAUNCH, "image.sif", `${"b".repeat(32)}\n${"b".repeat(31)}.sif`),
+    false,
+  ],
+  ["an absolute sif", set(LAUNCH, "image.sif", `/${HEX_B}.sif`), false],
+  ["a sif that climbs", set(LAUNCH, "image.sif", `../${HEX_B}.sif`), false],
+  ["a sif with a backslash", set(LAUNCH, "image.sif", `a\\${"b".repeat(62)}.sif`), false],
+  [
+    "a sif with a control character",
+    set(LAUNCH, "image.sif", `\u0001${"b".repeat(63)}.sif`),
+    false,
+  ],
+  ["a sif with non-ASCII", set(LAUNCH, "image.sif", `${"b".repeat(63)}é.sif`), false],
+  ["an empty sif", set(LAUNCH, "image.sif", ""), false],
+  ["a sif that is a number", set(LAUNCH, "image.sif", 5), false],
   ["no sif", set(LAUNCH, "image.sif", undefined), false],
   ["no args key", set(LAUNCH, "args", undefined), false],
   ["no datasets key", set(LAUNCH, "datasets", undefined), false],
   ["no env key", set(LAUNCH, "env", undefined), false],
   ["no resources key", set(LAUNCH, "resources", undefined), false],
-  ["a dataset id in capitals", set(LAUNCH, "datasets", [{ id: "NM000104", version: "1" }]), false],
+  [
+    "a dataset id in capitals",
+    set(LAUNCH, "datasets", [{ id: "NM000104", version: "v1.0.2" }]),
+    false,
+  ],
+  // The data-plane tag: `latest` or `v<major>.<minor>.<patch>`, exactly what the data plane accepts.
+  ["the version latest", set(LAUNCH, "datasets", [{ id: "nm000104", version: "latest" }]), true],
+  [
+    "a version with large numbers",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v10.200.3000" }]),
+    true,
+  ],
+  ["a version of zeros", set(LAUNCH, "datasets", [{ id: "nm000104", version: "v0.0.0" }]), true],
+  [
+    "a version with leading zeros",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v01.02.03" }]),
+    true,
+  ],
+  [
+    "a bare version with no v",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "1.0.2" }]),
+    false,
+  ],
+  ["a one-number version", set(LAUNCH, "datasets", [{ id: "nm000104", version: "1" }]), false],
+  ["a v and one number", set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1" }]), false],
+  ["a v and two numbers", set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0" }]), false],
+  [
+    "a v and four numbers",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2.3" }]),
+    false,
+  ],
+  ["a capital V", set(LAUNCH, "datasets", [{ id: "nm000104", version: "V1.0.2" }]), false],
+  ["Latest in capitals", set(LAUNCH, "datasets", [{ id: "nm000104", version: "Latest" }]), false],
+  [
+    "latest with a suffix",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "latest1" }]),
+    false,
+  ],
+  [
+    "latest with a trailing newline",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "latest\n" }]),
+    false,
+  ],
+  [
+    "a tag with a trailing newline",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2\n" }]),
+    false,
+  ],
+  [
+    "a tag with a leading space",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: " v1.0.2" }]),
+    false,
+  ],
+  [
+    "a tag with a prerelease",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2-rc1" }]),
+    false,
+  ],
+  [
+    "a tag with build metadata",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2+b" }]),
+    false,
+  ],
+  ["a doubled v", set(LAUNCH, "datasets", [{ id: "nm000104", version: "vv1.0.2" }]), false],
+  [
+    "a tag with a letter in a number",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.a" }]),
+    false,
+  ],
+  [
+    "a tag with an empty number",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1..2" }]),
+    false,
+  ],
+  [
+    "a tag with a trailing dot",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0." }]),
+    false,
+  ],
+  [
+    "a tag with a leading dot",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v.1.2" }]),
+    false,
+  ],
+  ["only a v", set(LAUNCH, "datasets", [{ id: "nm000104", version: "v" }]), false],
+  [
+    "a tag with a letter for the first dot",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1x0.2" }]),
+    false,
+  ],
+  [
+    "a tag with a letter for the second dot",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0x2" }]),
+    false,
+  ],
+  ["an empty version", set(LAUNCH, "datasets", [{ id: "nm000104", version: "" }]), false],
+  ["a branch name", set(LAUNCH, "datasets", [{ id: "nm000104", version: "main" }]), false],
+  ["a version that is a number", set(LAUNCH, "datasets", [{ id: "nm000104", version: 1 }]), false],
+  [
+    "a tag in non-ASCII digits",
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v١.٠.٢" }]),
+    false,
+  ],
   ["a dataset with no version", set(LAUNCH, "datasets", [{ id: "nm000104" }]), false],
   [
     "an include that climbs",
-    set(LAUNCH, "datasets", [{ id: "nm000104", version: "1", include: ["../x"] }]),
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2", include: ["../x"] }]),
     false,
   ],
   [
     "an absolute include",
-    set(LAUNCH, "datasets", [{ id: "nm000104", version: "1", include: ["/x"] }]),
+    set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2", include: ["/x"] }]),
     false,
   ],
   [
@@ -1748,7 +2272,7 @@ const LAUNCH_CASES: readonly Case[] = [
     set(
       LAUNCH,
       "datasets",
-      Array.from({ length: 21 }, () => ({ id: "nm000104", version: "1" })),
+      Array.from({ length: 21 }, () => ({ id: "nm000104", version: "v1.0.2" })),
     ),
     false,
   ],
@@ -1766,6 +2290,57 @@ const LAUNCH_CASES: readonly Case[] = [
   ["null", null, false],
 ];
 
+/**
+ * What only zod enforces: a document the JSON Schema accepts and zod refuses, because the rule
+ * compares two fields and a JSON Schema cannot. Listed here on purpose, so that a difference between
+ * the two engines is always a row in this table and never a surprise: `agree` above holds every other
+ * document to one verdict. Each row says which key the zod issue names.
+ */
+const ZOD_ONLY_LAUNCH_CASES: ReadonlyArray<
+  readonly [label: string, doc: unknown, keys: readonly string[]]
+> = [
+  [
+    "a sif named for another image's digest",
+    set(LAUNCH, "image.sif", `${HEX_A}.sif`),
+    ["image.sif"],
+  ],
+  [
+    "a digest that is neither the one the sif is named for nor the one the uri is pinned to",
+    set(LAUNCH, "image.digest", `sha256:${HEX_A}`),
+    ["image.sif", "image.uri"],
+  ],
+  [
+    "a sif that differs from the digest in its last hex digit",
+    set(LAUNCH, "image.sif", `${"b".repeat(63)}c.sif`),
+    ["image.sif"],
+  ],
+  [
+    "a sif that differs from the digest in its first hex digit",
+    set(LAUNCH, "image.sif", `c${"b".repeat(63)}.sif`),
+    ["image.sif"],
+  ],
+  [
+    "an image uri pinned to another digest than image.digest",
+    set(LAUNCH, "image.uri", `docker://ghcr.io/example/runtime@sha256:${HEX_A}`),
+    ["image.uri"],
+  ],
+  [
+    "an image uri with no prefix pinned to another digest",
+    set(LAUNCH, "image.uri", `ghcr.io/example/runtime@sha256:${HEX_A}`),
+    ["image.uri"],
+  ],
+  [
+    "an image uri that differs from the digest in its last hex digit",
+    set(LAUNCH, "image.uri", `docker://ghcr.io/example/runtime@sha256:${"b".repeat(63)}c`),
+    ["image.uri"],
+  ],
+  [
+    "an image uri that differs from the digest in its first hex digit",
+    set(LAUNCH, "image.uri", `docker://ghcr.io/example/runtime@sha256:c${"b".repeat(63)}`),
+    ["image.uri"],
+  ],
+];
+
 describe("the launch specification", () => {
   test("the version is nemar.launch-spec.v1 and the runtimes are python and image", () => {
     expect(LAUNCH_SPEC_VERSION).toBe("nemar.launch-spec.v1");
@@ -1780,6 +2355,197 @@ describe("the launch specification", () => {
       (d) => validateRoot(d) as boolean,
       (d) => LaunchSpecSchema.safeParse(d).success,
     );
+  });
+
+  test("the rules only zod enforces are listed, and each is one the JSON Schema accepts", () => {
+    expect(ZOD_ONLY_LAUNCH_CASES.length).toBeGreaterThanOrEqual(8);
+    for (const [label, doc, keys] of ZOD_ONLY_LAUNCH_CASES) {
+      expect(validateRoot(doc), `JSON Schema: ${label}`).toBe(true);
+      const refused = LaunchSpecSchema.safeParse(doc);
+      expect(refused.success, `zod: ${label}`).toBe(false);
+      if (refused.success) continue;
+      // One issue for each field the rule names, in order, and never a digest in a message.
+      expect(
+        refused.error.issues.map((i) => i.path.join(".")),
+        label,
+      ).toEqual([...keys]);
+      for (const issue of refused.error.issues) {
+        expect(issue.message, label).not.toContain(HEX_A);
+        expect(issue.message, label).not.toContain(HEX_B);
+      }
+    }
+  });
+
+  test("sifFileNameForDigest is the digest's hex plus .sif, and null for anything else", () => {
+    expect(sifFileNameForDigest(`sha256:${HEX_B}`)).toBe(`${HEX_B}.sif`);
+    expect(sifFileNameForDigest(`sha256:${HEX_A}`)).toBe(`${HEX_A}.sif`);
+    expect(sifFileNameForDigest(`sha256:${"0123456789abcdef".repeat(4)}`)).toBe(
+      `${"0123456789abcdef".repeat(4)}.sif`,
+    );
+    for (const bad of [
+      "",
+      HEX_B,
+      `sha256:${"b".repeat(63)}`,
+      `sha256:${"b".repeat(65)}`,
+      `sha256:${"B".repeat(64)}`,
+      `sha256:${HEX_B}\n`,
+      `\nsha256:${HEX_B}`,
+      `sha512:${HEX_B}`,
+      `SHA256:${HEX_B}`,
+      `sha256:g${"b".repeat(63)}`,
+      `sha256: ${HEX_B}`,
+      `docker://x@sha256:${HEX_B}`,
+    ]) {
+      expect(sifFileNameForDigest(bad), JSON.stringify(bad)).toBeNull();
+    }
+    expect(sifFileNameForDigest(5 as never)).toBeNull();
+    // Not a string, though it reads as one: an object, an array of the digest.
+    expect(sifFileNameForDigest({ toString: () => `sha256:${HEX_B}` } as never)).toBeNull();
+    expect(sifFileNameForDigest([`sha256:${HEX_B}`] as never)).toBeNull();
+    expect(sifFileNameForDigest(null as never)).toBeNull();
+    expect(sifFileNameForDigest(undefined as never)).toBeNull();
+  });
+
+  test("the zod rule is the helper: a document is accepted exactly when its sif is the helper's", () => {
+    for (const hex of [HEX_A, HEX_B, "0123456789abcdef".repeat(4)]) {
+      const named = sifFileNameForDigest(`sha256:${hex}`);
+      const doc = set(
+        set(set(LAUNCH, "image.digest", `sha256:${hex}`), "image.sif", named),
+        "image.uri",
+        `docker://ghcr.io/example/runtime@sha256:${hex}`,
+      );
+      expect(LaunchSpecSchema.safeParse(doc).success, hex).toBe(true);
+    }
+  });
+
+  test("a bad digest or a bad sif is named once, by its own issue, and not again by the cross rule", () => {
+    const paths = (doc: unknown) => {
+      const refused = LaunchSpecSchema.safeParse(doc);
+      return refused.success ? [] : refused.error.issues.map((i) => i.path.join("."));
+    };
+    expect(paths(set(LAUNCH, "image.digest", HEX_B))).toEqual(["image.digest"]);
+    expect(paths(set(LAUNCH, "image.sif", "runtime.sif"))).toEqual(["image.sif"]);
+    expect(paths(set(LAUNCH, "image.sif", `${HEX_B}.sif\n`))).toEqual(["image.sif"]);
+    expect(paths(set(LAUNCH, "image.sif", `${HEX_A}.sif`))).toEqual(["image.sif"]);
+    expect(paths(LAUNCH)).toEqual([]);
+  });
+
+  test("a malformed sif and a well-formed sif of another digest are refused for their own reasons", () => {
+    const FORM = "the image file is not <64 lowercase hex>.sif";
+    const NAMED = "the image file is not the one named for the image digest";
+    const messages = (sif: unknown) => {
+      const refused = LaunchSpecSchema.safeParse(set(LAUNCH, "image.sif", sif));
+      return refused.success ? [] : refused.error.issues.map((i) => i.message);
+    };
+    for (const bad of [
+      "runtime.sif",
+      `images/${HEX_B}.sif`,
+      `${"B".repeat(64)}.sif`,
+      `${"b".repeat(63)}.sif`,
+      `${"b".repeat(65)}.sif`,
+      `g${"b".repeat(63)}.sif`,
+      HEX_B,
+      `${HEX_B}.SIF`,
+      `${HEX_B}.sif.sif`,
+      `${HEX_B}.sifx`,
+      `${HEX_B}xsif`,
+      `${HEX_B}-sif`,
+      `-${HEX_B}.sif`,
+      `${HEX_B}.sif\n`,
+      `../${HEX_B}.sif`,
+      ".sif",
+      "",
+    ]) {
+      expect(messages(bad), JSON.stringify(bad)).toEqual([FORM]);
+    }
+    for (const other of [`${HEX_A}.sif`, `${"b".repeat(63)}c.sif`, `c${"b".repeat(63)}.sif`]) {
+      expect(messages(other), other).toEqual([NAMED]);
+    }
+  });
+
+  test("an image uri that is not pinned to image.digest is refused for its own reason, once", () => {
+    const messages = (uri: unknown) => {
+      const refused = LaunchSpecSchema.safeParse(set(LAUNCH, "image.uri", uri));
+      return refused.success ? [] : refused.error.issues.map((i) => i.message);
+    };
+    const FORM = "the image reference is not a digest-pinned reference";
+    const NAMED = "the image reference is not pinned to the image digest";
+    // A well-formed reference of another digest: only the cross rule speaks.
+    for (const other of [
+      `docker://ghcr.io/example/runtime@sha256:${HEX_A}`,
+      `ghcr.io/example/runtime@sha256:${"b".repeat(63)}c`,
+    ]) {
+      expect(messages(other), other).toEqual([NAMED]);
+    }
+    // A malformed one: the field's own rule speaks, and the cross rule keeps quiet.
+    for (const bad of ["docker://ghcr.io/example/runtime", "--rm", `ghcr.io@sha256:${HEX_B}`, ""]) {
+      expect(messages(bad), bad).toEqual([FORM]);
+    }
+    // And a bad digest is named once, by the digest's own rule, whatever the uri ends with.
+    for (const digest of [
+      HEX_B,
+      "sha256:zzz",
+      "nope",
+      "",
+      `sha256:${HEX_B}\n`,
+      `sha256:${"b".repeat(63)}`,
+    ]) {
+      const refused = LaunchSpecSchema.safeParse(set(LAUNCH, "image.digest", digest));
+      expect(
+        refused.success ? [] : refused.error.issues.map((i) => i.path.join(".")),
+        JSON.stringify(digest),
+      ).toEqual(["image.digest"]);
+    }
+  });
+
+  test("the shared descriptions of version, sif and uri state the contract and carry no Worker narrative", () => {
+    const image = (launchSchema as Doc).properties.image.properties;
+    const version = (launchSchema as Doc).properties.datasets.items.properties.version;
+    for (const [name, text] of [
+      ["version", version.description],
+      ["sif", image.sif.description],
+      ["uri", image.uri.description],
+    ] as const) {
+      expect(typeof text, name).toBe("string");
+      for (const narrative of [
+        "Worker",
+        "encoder",
+        "NEMAR enforces",
+        "writes the tag",
+        "1.0.2 becomes",
+      ]) {
+        expect(text, `${name}: ${narrative}`).not.toContain(narrative);
+      }
+    }
+    expect(version.description).toContain("latest, or v<major>.<minor>.<patch>");
+    expect(version.description).toContain("exactly what the data plane accepts");
+    // The two cross-field rules are named as rules only zod enforces.
+    expect(image.sif.description).toContain("zod-only");
+    expect(image.uri.description).toContain("zod-only");
+    expect(image.uri.description).toContain("cannot express");
+    expect(image.uri.description).toContain("image.digest");
+  });
+
+  test("the schema says plainly which rule it cannot express", () => {
+    const sif = (launchSchema as Doc).properties.image.properties.sif;
+    expect(sif.description).toContain("NEMAR_SIF_ROOT");
+    expect(sif.description).toContain("image.digest");
+    expect(sif.description).toContain("cannot express");
+    expect(sif.description).toContain("does not verify");
+    expect(sif.description).toContain("image_missing");
+    // The rule is zod's, and a Worker's, so the schema keeps no cross-field keyword for it.
+    expect(JSON.stringify(sif)).not.toContain("$data");
+  });
+
+  test("encodeLaunchSpec refuses a sif that is not the digest's, and never echoes either", () => {
+    let message = "";
+    try {
+      encodeLaunchSpec(set(LAUNCH, "image.sif", `${HEX_A}.sif`));
+    } catch (error) {
+      message = (error as Error).message;
+    }
+    expect(message).toContain("image.sif");
+    expect(message).not.toContain(HEX_A);
   });
 
   test("encodeLaunchSpec writes JSON the schema accepts, within 64 KiB", () => {
@@ -1875,7 +2641,7 @@ describe("the launch specification", () => {
   });
 });
 
-describe("a valid job specification always fits the launch specification", () => {
+describe("a valid job specification always fits the 64 KiB launch specification and is well formed", () => {
   const E = "\u00e9";
   const baseJob = (extra: Record<string, unknown>) => ({ ...SPEC, ...extra });
 
@@ -1983,9 +2749,13 @@ describe("a valid job specification always fits the launch specification", () =>
       ...(job.entry !== undefined ? { entry: job.entry } : { command: job.command ?? ["x"] }),
       args: job.args,
       bundle: { sha256: hex, size: Number.MAX_SAFE_INTEGER },
-      datasets: job.datasets.map((d) => ({ ...d })),
+      datasets: job.datasets.map((d) => ({
+        ...d,
+        // The Worker writes the data-plane tag: v<version> unless it already is one.
+        version: d.version === "latest" || d.version.startsWith("v") ? d.version : `v${d.version}`,
+      })),
       api_base: `https://${"a".repeat(504)}`,
-      image: { uri: ref, digest: `sha256:${hex}`, sif: "s".repeat(256) },
+      image: { uri: ref, digest: `sha256:${hex}`, sif: `${hex}.sif` },
       env: job.env,
       resources: { gpus: job.gpus },
       limits: { max_files: 1_000_000, max_total_bytes: Number.MAX_SAFE_INTEGER },
@@ -1996,7 +2766,7 @@ describe("a valid job specification always fits the launch specification", () =>
 
   const twentyDatasets = Array.from({ length: 20 }, (_, i) => ({
     id: `nm0001${String(i).padStart(2, "0")}`,
-    version: `v${"9".repeat(63)}`,
+    version: `${"9".repeat(59)}.0.0`,
   }));
   const imageRef = `docker://ghcr.io/${"a".repeat(423)}@sha256:${"b".repeat(64)}`;
 
@@ -2105,6 +2875,17 @@ describe("a valid job specification always fits the launch specification", () =>
     expect(launchSpecFits(big)).toBe(false);
     const wide = { ...parsed, args: Array.from({ length: 12 }, () => E.repeat(1024)) };
     expect(launchSpecFits(wide)).toBe(false);
+    // A dataset version with no data-plane tag cannot be launched, whatever its size.
+    const withVersion = (version: string) => ({
+      ...parsed,
+      datasets: [{ id: "nm000104", version }],
+    });
+    for (const ok of ["1.0.2", "v1.0.2", "latest"]) {
+      expect(launchSpecFits(withVersion(ok)), ok).toBe(true);
+    }
+    for (const bad of ["1", "1.0", "abc", "", "v1", "1.0.2-rc1"]) {
+      expect(launchSpecFits(withVersion(bad)), bad).toBe(false);
+    }
     // Anything the launch specification would refuse is also a no.
     expect(launchSpecFits({ ...parsed, gpus: 99 })).toBe(false);
     expect(launchSpecFits({ ...parsed, entry: "../x" })).toBe(false);
@@ -2125,7 +2906,7 @@ describe("a valid job specification always fits the launch specification", () =>
             { id: "nm000104", version: "1.0.2", include: ["sub-01/**/*.set", "sub-02/*"] },
           ],
         }),
-        2119,
+        1932,
       ],
       [
         "an image job with a command and a GPU",
@@ -2138,7 +2919,7 @@ describe("a valid job specification always fits the launch specification", () =>
           gpus: 2,
           minutes: 30,
         }),
-        2012,
+        1824,
       ],
       [
         "a recipe job, which names neither an entry nor a command",
@@ -2146,11 +2927,11 @@ describe("a valid job specification always fits the launch specification", () =>
           name: "r",
           runtime: "python",
           recipe: "nemar-floor",
-          datasets: [{ id: "nm000104", version: "1" }],
+          datasets: [{ id: "nm000104", version: "1.0.0" }],
           partition: "shared",
           minutes: 5,
         }),
-        2016,
+        1833,
       ],
     ];
 
@@ -2215,7 +2996,7 @@ describe("a valid job specification always fits the launch specification", () =>
             image: { ...worst.image, uri: `docker://ghcr.io/${"a".repeat(424)}@sha256:${hex}` },
           },
         ],
-        ["image.sif", { ...worst, image: { ...worst.image, sif: "s".repeat(257) } }],
+        ["image.sif", { ...worst, image: { ...worst.image, sif: `${"f".repeat(65)}.sif` } }],
         ["job_token", { ...worst, job_token: "t".repeat(257) }],
         [
           "bundle.size",
@@ -2251,7 +3032,7 @@ describe("a valid job specification always fits the launch specification", () =>
         name: "r",
         runtime: "python",
         recipe: "nemar-floor",
-        datasets: [{ id: "nm000104", version: "1" }],
+        datasets: [{ id: "nm000104", version: "1.0.0" }],
         partition: "shared",
         minutes: 5,
       },
@@ -2259,6 +3040,150 @@ describe("a valid job specification always fits the launch specification", () =>
     ];
     for (const job of jobs)
       expect(launchSpecFits(JobSpecSchema.parse(job)), String(job.runtime)).toBe(true);
+  });
+});
+
+describe("what an entry, a command, args and an include pattern mean is part of the contract", () => {
+  const props = (launchSchema as Doc).properties;
+  const includeSchema = props.datasets.items.properties.include;
+  const LAUNCH_ONE = " Exactly one of entry and command is present.";
+  /** The zod object of each schema, behind the refinement that wraps it. */
+  const jobShape = (JobSpecSchema as unknown as { _def: { schema: z.AnyZodObject } })._def.schema
+    .shape;
+  const launchShape = (LaunchSpecSchema as unknown as { _def: { schema: z.AnyZodObject } })._def
+    .schema.shape;
+
+  test("the entry: python /code/<entry>, or /code/<entry> directly for an image", () => {
+    const text = COMPUTE_ENTRY_DESCRIPTION;
+    expect(text).toContain("python /code/<entry>");
+    expect(text).toContain("followed by args");
+    expect(text).toContain("runtime image");
+    expect(text).toContain("/code/<entry> directly");
+    expect(text).toContain("executable bit");
+    expect(text).toContain("bundle packer must preserve");
+    expect(text).toContain("python on its PATH");
+    expect(text).toContain("leading ./");
+    for (const refused of ["absolute names", ".. segments", "links", "devices", "FIFOs"]) {
+      expect(text, refused).toContain(refused);
+    }
+    expect(text).toContain("refused by the launcher");
+  });
+
+  test("the command runs as given with args appended", () => {
+    expect(COMPUTE_COMMAND_DESCRIPTION).toContain("run as given");
+    expect(COMPUTE_COMMAND_DESCRIPTION).toContain("args appended");
+  });
+
+  test("the args follow the entry or the command, each as one argument", () => {
+    const text = COMPUTE_ARGS_DESCRIPTION;
+    expect(text).toContain("python /code/<entry>");
+    expect(text).toContain("after /code/<entry>");
+    expect(text).toContain("after the command");
+    expect(text).toContain("each as one argument");
+  });
+
+  test("the include dialect: manifest paths, **, * and ?, classes, case, no escapes, linear time", () => {
+    const text = COMPUTE_INCLUDE_DESCRIPTION;
+    expect(text).toContain("manifest paths relative to the dataset root");
+    expect(text).toContain("**/ matches zero or more directories (so a/**/b matches a/b)");
+    expect(text).toContain("** elsewhere matches any run of characters including /");
+    expect(text).toContain("* and ? stay inside one path segment");
+    expect(text).toContain("[abc], [a-c] and [!abc]");
+    expect(text).toContain(
+      "a character class never matches /, so like * and ? it stays inside one path segment",
+    );
+    expect(text).toContain("a negated class [!a] matches any single character except a and /");
+    expect(text).toContain("an unterminated [ is a literal [");
+    expect(text).toContain("an empty class [] and an inverted range such as [z-a] are refused");
+    expect(text).toContain("bad_include is exactly the set of patterns this dialect refuses");
+    expect(text).toContain("case-sensitive");
+    expect(text).toContain("no escapes");
+    expect(text).toContain("MUST run in time linear");
+    expect(text).toContain("pattern's length times the path's length");
+    expect(text).toContain("no backtracking");
+    // And nothing about a limit on wildcards: there is none.
+    expect(text).not.toContain("at most");
+  });
+
+  test("the schema's descriptions are these texts, word for word", () => {
+    expect(props.entry.description).toBe(COMPUTE_ENTRY_DESCRIPTION + LAUNCH_ONE);
+    expect(props.command.description).toBe(COMPUTE_COMMAND_DESCRIPTION + LAUNCH_ONE);
+    expect(props.args.description).toBe(COMPUTE_ARGS_DESCRIPTION);
+    expect(includeSchema.description).toBe(COMPUTE_INCLUDE_DESCRIPTION);
+  });
+
+  test("zod carries the same texts, on the launch specification and on the job specification", () => {
+    expect(launchShape.entry.description).toBe(COMPUTE_ENTRY_DESCRIPTION + LAUNCH_ONE);
+    expect(launchShape.command.description).toBe(COMPUTE_COMMAND_DESCRIPTION + LAUNCH_ONE);
+    expect(launchShape.args.description).toBe(COMPUTE_ARGS_DESCRIPTION);
+    expect(jobShape.entry.description).toBe(COMPUTE_ENTRY_DESCRIPTION);
+    expect(jobShape.command.description).toBe(COMPUTE_COMMAND_DESCRIPTION);
+    expect(jobShape.args.description).toBe(COMPUTE_ARGS_DESCRIPTION);
+    // The element of `datasets`, through the default a job gives it.
+    const include = (shape: z.AnyZodObject["shape"]) => {
+      // biome-ignore lint/suspicious/noExplicitAny: zod's definitions are walked by key
+      let field: any = shape.datasets;
+      while (field._def.innerType) field = field._def.innerType;
+      return field._def.type.shape.include.description;
+    };
+    expect(include(launchShape)).toBe(COMPUTE_INCLUDE_DESCRIPTION);
+    expect(include(jobShape)).toBe(COMPUTE_INCLUDE_DESCRIPTION);
+  });
+
+  test("the job specification's docblock states the same semantics", () => {
+    const source = readFileSync(
+      join(import.meta.dir, "..", "shared", "contract", "compute.ts"),
+      "utf8",
+    );
+    const end = source.indexOf("export const JobSpecSchema = z");
+    expect(end).toBeGreaterThan(0);
+    // The comment's line breaks and asterisks are not part of what it says.
+    const docblock = source
+      .slice(source.lastIndexOf("/**", end), end)
+      .replace(/\n\s*\*\s?/g, " ")
+      .replace(/\s+/g, " ");
+    for (const phrase of [
+      "`runtime: python` with an `entry` runs `python /code/<entry>` followed by `args`",
+      "a `command` runs as given with `args` appended",
+      "`runtime: image` with an `entry` is allowed and runs `/code/<entry>` directly",
+      "executable bit that the bundle packer must preserve",
+      "must provide `python` on its PATH",
+      "may carry a leading `./`",
+      "links, devices and FIFOs are refused by the launcher",
+      "matched against manifest paths relative to the dataset root",
+      "`**` followed by `/` matches zero or more directories",
+      "`**` elsewhere matches any run of characters including `/`",
+      "`*` and `?` stay inside one path segment",
+      "`[abc]`, `[a-c]` and `[!abc]`",
+      "a character class never matches `/`",
+      "a negated class `[!a]` matches any single character except `a` and `/`",
+      "an unterminated `[` is a literal `[`",
+      "an empty class `[]` and an inverted range such as `[z-a]` are refused",
+      "`bad_include` is exactly the set of patterns the dialect refuses",
+      "`includePatternProblem`",
+      "case-sensitive",
+      "no escapes",
+      "linear in the pattern length times the path length",
+      "`dataTagForVersion`",
+    ]) {
+      expect(docblock, phrase).toContain(phrase);
+    }
+  });
+
+  test("an image job may name an entry: it is a valid job and a valid launch specification", () => {
+    const job = {
+      name: "tool",
+      runtime: "image",
+      image: `ghcr.io/e/t@sha256:${HEX_B}`,
+      entry: "bin/run",
+      bundle: { size: 10, sha256: HEX_A },
+      partition: "shared",
+      minutes: 5,
+    };
+    expect(specRefused(job)).toBe(false);
+    expect(LaunchSpecSchema.safeParse(set(LAUNCH, "runtime", "image")).success).toBe(true);
+    // It still needs the bundle that holds it.
+    expect(specRefused({ ...job, bundle: undefined })).toBe(true);
   });
 });
 
@@ -2273,24 +3198,24 @@ describe("the golden vector nemar-process checks its launcher against", () => {
     entry: "run.py",
     args: ["--label", 'caf\u00e9 "q" \u{1F600}'],
     bundle: { sha256: "a".repeat(64), size: 1234 },
-    datasets: [{ id: "nm000104", version: "1.0.2" }],
+    datasets: [{ id: "nm000104", version: "v1.0.2" }],
     api_base: "https://api.example.test",
     image: {
       uri: `docker://ghcr.io/example/runtime@sha256:${"b".repeat(64)}`,
       digest: `sha256:${"b".repeat(64)}`,
-      sif: "runtime.sif",
+      sif: `${"b".repeat(64)}.sif`,
     },
     env: { OMP_NUM_THREADS: "4" },
     resources: { gpus: 0 },
     limits: { max_files: 38000, max_total_bytes: 1073741824 },
     job_token: "t".repeat(43),
   };
-  const GOLDEN_TEXT = String.raw`{"job_id":"job_0123456789abcdef01234567","runtime":"python","entry":"run.py","args":["--label","caf\u00e9 \"q\" \ud83d\ude00"],"bundle":{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1234},"datasets":[{"id":"nm000104","version":"1.0.2"}],"api_base":"https://api.example.test","image":{"uri":"docker://ghcr.io/example/runtime@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sif":"runtime.sif"},"env":{"OMP_NUM_THREADS":"4"},"resources":{"gpus":0},"limits":{"max_files":38000,"max_total_bytes":1073741824},"job_token":"ttttttttttttttttttttttttttttttttttttttttttt"}`;
-  const GOLDEN_SHA256 = "68ef4653b8745eebf16427cd87a01e6d672b8062f8bfef819fcd1d745f0e346a";
+  const GOLDEN_TEXT = String.raw`{"job_id":"job_0123456789abcdef01234567","runtime":"python","entry":"run.py","args":["--label","caf\u00e9 \"q\" \ud83d\ude00"],"bundle":{"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","size":1234},"datasets":[{"id":"nm000104","version":"v1.0.2"}],"api_base":"https://api.example.test","image":{"uri":"docker://ghcr.io/example/runtime@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sif":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.sif"},"env":{"OMP_NUM_THREADS":"4"},"resources":{"gpus":0},"limits":{"max_files":38000,"max_total_bytes":1073741824},"job_token":"ttttttttttttttttttttttttttttttttttttttttttt"}`;
+  const GOLDEN_SHA256 = "88fcf9a4d6e63ae7bbedc9be536989fd7f2c263bb2b1c2fb6cfd706f49efe857";
 
   test("encodeLaunchSpec writes exactly the golden text", () => {
     expect(encodeLaunchSpec(GOLDEN_SPEC)).toBe(GOLDEN_TEXT);
-    expect(GOLDEN_TEXT.length).toBe(708);
+    expect(GOLDEN_TEXT.length).toBe(766);
   });
 
   test("the golden text hashes to the golden digest, and parses back to the specification", () => {
@@ -2798,7 +3723,8 @@ const COMMAND_BASE = {
   command: ["c"],
 };
 /** A digest-pinned image reference of exactly `n` characters. */
-const imageRef = (n: number) => `docker://ghcr.io/${"a".repeat(n - 89)}@sha256:${HASH}`;
+// Pinned to the launch specification's own image digest, as the cross rule requires.
+const imageRef = (n: number) => `docker://ghcr.io/${"a".repeat(n - 89)}@sha256:${HEX_B}`;
 
 /**
  * The one table of every numeric and length bound in the launch schema, as literals. The corpus
@@ -2861,7 +3787,7 @@ const MAIN_BOUNDS: readonly Bound[] = [
     target: "root",
     kind: "max",
     at: 20,
-    build: (n) => set(LAUNCH, "datasets", Array(n).fill({ id: "nm000104", version: "1" })),
+    build: (n) => set(LAUNCH, "datasets", Array(n).fill({ id: "nm000104", version: "v1.0.2" })),
   },
   {
     label: "include patterns",
@@ -2869,7 +3795,7 @@ const MAIN_BOUNDS: readonly Bound[] = [
     kind: "max",
     at: 64,
     build: (n) =>
-      set(LAUNCH, "datasets", [{ id: "nm000104", version: "1", include: Array(n).fill("a") }]),
+      set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2", include: Array(n).fill("a") }]),
   },
   {
     label: "include pattern length",
@@ -2877,7 +3803,7 @@ const MAIN_BOUNDS: readonly Bound[] = [
     kind: "max",
     at: 256,
     build: (n) =>
-      set(LAUNCH, "datasets", [{ id: "nm000104", version: "1", include: ["a".repeat(n)] }]),
+      set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2", include: ["a".repeat(n)] }]),
   },
   {
     label: "include pattern length, at least",
@@ -2885,21 +3811,16 @@ const MAIN_BOUNDS: readonly Bound[] = [
     kind: "min",
     at: 1,
     build: (n) =>
-      set(LAUNCH, "datasets", [{ id: "nm000104", version: "1", include: ["a".repeat(n)] }]),
+      set(LAUNCH, "datasets", [{ id: "nm000104", version: "v1.0.2", include: ["a".repeat(n)] }]),
   },
   {
     label: "dataset version length",
     target: "root",
     kind: "max",
     at: 64,
-    build: (n) => set(LAUNCH, "datasets", [{ id: "nm000104", version: "1".repeat(n) }]),
-  },
-  {
-    label: "dataset version length, at least",
-    target: "root",
-    kind: "min",
-    at: 1,
-    build: (n) => set(LAUNCH, "datasets", [{ id: "nm000104", version: "1".repeat(n) }]),
+    // v<digits>.0.0: the tag grows by one digit at a time.
+    build: (n) =>
+      set(LAUNCH, "datasets", [{ id: "nm000104", version: `v${"9".repeat(n - 5)}.0.0` }]),
   },
   {
     label: "api_base length",
@@ -2928,20 +3849,6 @@ const MAIN_BOUNDS: readonly Bound[] = [
     kind: "max",
     at: 512,
     build: (n) => set(LAUNCH, "image.uri", imageRef(n)),
-  },
-  {
-    label: "image sif length",
-    target: "root",
-    kind: "max",
-    at: 256,
-    build: (n) => set(LAUNCH, "image.sif", "s".repeat(n)),
-  },
-  {
-    label: "image sif length, at least",
-    target: "root",
-    kind: "min",
-    at: 1,
-    build: (n) => set(LAUNCH, "image.sif", "s".repeat(n)),
   },
   {
     label: "env value length",
@@ -3254,7 +4161,7 @@ const EXTRA_BOUNDS: readonly Bound[] = [
     kind: "max",
     at: 5,
     build: (n) =>
-      set(LAUNCH, "image.uri", `registry.example.test:${"1".repeat(n)}/team/tool@sha256:${HASH}`),
+      set(LAUNCH, "image.uri", `registry.example.test:${"1".repeat(n)}/team/tool@sha256:${HEX_B}`),
   },
   {
     label: "image uri port digits, at least",
@@ -3262,7 +4169,7 @@ const EXTRA_BOUNDS: readonly Bound[] = [
     kind: "min",
     at: 1,
     build: (n) =>
-      set(LAUNCH, "image.uri", `registry.example.test:${"1".repeat(n)}/team/tool@sha256:${HASH}`),
+      set(LAUNCH, "image.uri", `registry.example.test:${"1".repeat(n)}/team/tool@sha256:${HEX_B}`),
   },
   {
     label: "launcher file size, at least",

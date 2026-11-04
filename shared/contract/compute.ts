@@ -82,7 +82,54 @@ export const COMPUTE_IMAGE_DIGEST_RE = /^sha256:[0-9a-f]{64}$/;
 
 /** Two lowercase letters and six digits: `nm000104`, `on000001`, `xx099900`, `ds002718`. */
 export const COMPUTE_DATASET_ID_RE = /^[a-z]{2}[0-9]{6}$/;
+/**
+ * A dataset version as a job names it (loose, so `1.0.2`, `v1.0.2` and `latest` all pass) and as the
+ * launcher's provenance records it (`staging[].version`: the data-plane tag it fetched, so every tag
+ * {@link dataTagForVersion} returns must fit this, at most 64 characters). The launch specification
+ * carries the data-plane tag instead of the loose form: see {@link dataTagForVersion}.
+ */
 export const COMPUTE_DATASET_VERSION_RE = /^[0-9A-Za-z][0-9A-Za-z._+-]{0,63}$/;
+
+/**
+ * The data plane's name for a dataset version: `latest`, or `v<major>.<minor>.<patch>` (the data
+ * plane accepts exactly these; see `VERSION_TAG_RE` in `backend/src/services/data-router.ts`, which
+ * a test holds this to). It is the form the launch specification carries, where the user-facing job
+ * specification (which keeps accepting `1.0.2`) names a version more loosely.
+ */
+export const COMPUTE_DATA_TAG_RE = /^(?:latest|v[0-9]+\.[0-9]+\.[0-9]+)$/;
+
+/**
+ * The longest data-plane tag, 64 characters: what a provenance `staging[].version` may hold
+ * ({@link COMPUTE_DATASET_VERSION_RE}), because the launcher records the tag it fetched there and
+ * the Worker parses that file strictly. A bare job version can therefore be at most 63 characters.
+ */
+export const COMPUTE_DATA_TAG_MAX = 64;
+
+/**
+ * The data-plane tag for a dataset version as a job names it: `1.0.2` gives `v1.0.2`; `v1.0.2` and
+ * `latest` are already tags and come back unchanged; anything else has no tag and is null, as is a
+ * tag longer than {@link COMPUTE_DATA_TAG_MAX}. The Worker's launch-specification builder uses it
+ * and refuses a job whose dataset version has none. Pure.
+ */
+export function dataTagForVersion(version: string): string | null {
+  if (typeof version !== "string") return null;
+  // A version that starts with a digit is bare; the whole is checked once it has its v.
+  const tag = /^[0-9]/.test(version) ? `v${version}` : version;
+  return tag.length <= COMPUTE_DATA_TAG_MAX && COMPUTE_DATA_TAG_RE.test(tag) ? tag : null;
+}
+
+/**
+ * The path of the first dataset whose version has no data-plane tag, as `datasets.<i>.version`, or
+ * null when every one has a tag (or there are none). A job specification may carry such a version
+ * (it is valid for a job), so a Worker or a CLI that finds one refuses with `invalid_spec` and names
+ * this field, before the hold. Pure.
+ */
+export function datasetVersionWithoutTag(
+  datasets: ReadonlyArray<{ version: string }>,
+): string | null {
+  const index = datasets.findIndex((d) => dataTagForVersion(d.version) === null);
+  return index < 0 ? null : `datasets.${index}.version`;
+}
 
 const MAX_SAFE = Number.MAX_SAFE_INTEGER;
 
@@ -109,7 +156,10 @@ export function computePathSchema(maxLength: number) {
 }
 const relativePath = computePathSchema;
 
-/** A dataset include pattern: 1 to 256 characters (the character class needs one) that never leave the dataset. */
+/**
+ * A dataset include pattern: 1 to 256 characters (the character class needs one) that never leave
+ * the dataset. Its dialect, and what a matcher owes, is {@link COMPUTE_INCLUDE_DESCRIPTION}.
+ */
 export const computeGlobSchema = z
   .string()
   .max(256)
@@ -432,6 +482,12 @@ export const LAUNCHER_ENV = {
   LOCAL_DATASETS_ROOT: "NEMAR_LOCAL_DATASETS_ROOT",
   /** An optional override of the host Python that runs the launcher. */
   HOST_PYTHON: "NEMAR_HOST_PYTHON",
+  /**
+   * The directory on the node that holds the Singularity image files, set by the Tapis application
+   * definition. The launch specification's `image.sif` is a basename relative to it. REQUIRED: the
+   * launcher has no fallback, and ends `image_missing` when it is unset.
+   */
+  SIF_ROOT: "NEMAR_SIF_ROOT",
 } as const;
 
 /**
@@ -459,6 +515,63 @@ export const computeEnvValueSchema = z.string().max(256).regex(ENV_VALUE_RE);
 export const computeJobEnvSchema = z.record(z.enum(JOB_ENV_ALLOWLIST), computeEnvValueSchema);
 
 // --- The job specification ---------------------------------------------------------------------
+
+// --- What an entry, a command, args and an include pattern mean ---------------------------------
+
+/**
+ * How the launcher runs the code a job names. These four texts are the contract, stated once: zod
+ * carries them as the `description` of the fields of both the job specification and the launch
+ * specification, and `compute-launch.schema.json` carries the same words, which a test holds to
+ * these. Widening any of them is a change to what the launcher does, and so to the shared schema.
+ */
+export const COMPUTE_ENTRY_DESCRIPTION =
+  "A path inside the bundle. With runtime python the launcher runs python /code/<entry> followed by args; with runtime image and an entry it runs /code/<entry> directly, followed by args, which needs the executable bit that the bundle packer must preserve. The runtime image must provide python on its PATH for the python runtime. A bundle archive's member names may carry a leading ./; absolute names, .. segments, links, devices and FIFOs are refused by the launcher.";
+
+export const COMPUTE_COMMAND_DESCRIPTION = "An argument vector, run as given, with args appended.";
+
+export const COMPUTE_ARGS_DESCRIPTION =
+  "Arguments, each as one argument: after python /code/<entry> (runtime python with an entry), after /code/<entry> (runtime image with an entry) or after the command.";
+
+/**
+ * The `include` dialect of a dataset reference. No cap on the number of wildcards: the bound is the
+ * matcher's, which must not backtrack.
+ */
+export const COMPUTE_INCLUDE_DESCRIPTION =
+  "Patterns that select the dataset's files, matched against manifest paths relative to the dataset root; every file when there are none. The dialect: **/ matches zero or more directories (so a/**/b matches a/b); ** elsewhere matches any run of characters including /; * and ? stay inside one path segment; [abc], [a-c] and [!abc] are character classes; a character class never matches /, so like * and ? it stays inside one path segment, and a negated class [!a] matches any single character except a and /; an unterminated [ is a literal [; an empty class [] and an inverted range such as [z-a] are refused, and bad_include is exactly the set of patterns this dialect refuses; matching is case-sensitive; there are no escapes. A matcher MUST run in time linear in the pattern's length times the path's length (no backtracking).";
+
+/**
+ * Why an `include` pattern is refused, or null if the dialect accepts it ({@link
+ * COMPUTE_INCLUDE_DESCRIPTION}): `empty_class` for a `[` (or `[!`) with a `]` straight after it, and
+ * `inverted_range` for a class holding a range whose end is before its start (`[z-a]`), compared by
+ * code point. A `[` with no `]` after it is a literal. The first problem from the left is the one
+ * named. This is exactly the set the launcher refuses as `bad_include`, so `JobSpecSchema` applies
+ * it and a job with such a pattern is refused at submit. Pure.
+ */
+export function includePatternProblem(pattern: string): "empty_class" | "inverted_range" | null {
+  let i = 0;
+  while (i < pattern.length) {
+    if (pattern[i] !== "[") {
+      i++;
+      continue;
+    }
+    const start = pattern[i + 1] === "!" ? i + 2 : i + 1;
+    const end = pattern.indexOf("]", start);
+    // Unterminated: a literal [, and so is any later one, since no ] follows any of them.
+    if (end === -1) return null;
+    if (end === start) return "empty_class";
+    const body = Array.from(pattern.slice(start, end), (c) => c.codePointAt(0) as number);
+    for (let p = 0; p < body.length; ) {
+      if (p + 2 < body.length && body[p + 1] === 0x2d) {
+        if (body[p] > body[p + 2]) return "inverted_range";
+        p += 3;
+      } else {
+        p++;
+      }
+    }
+    i = end + 1;
+  }
+  return null;
+}
 
 export const JOB_RUNTIMES = ["python", "matlab", "image"] as const;
 
@@ -505,13 +618,28 @@ const processText = <T extends z.ZodTypeAny>(schema: T) =>
     message: "a lone surrogate is not text a process argument can carry",
   });
 
+/** A refinement for one include pattern: a pattern the dialect refuses is refused here, by its word. */
+function refuseBadInclude(pattern: string, ctx: z.RefinementCtx): void {
+  const problem = includePatternProblem(pattern);
+  if (problem !== null) {
+    ctx.addIssue({
+      code: z.ZodIssueCode.custom,
+      message: `an include pattern the dialect refuses: ${problem}`,
+    });
+  }
+}
+
 const bundleRefSchema = z.object({ size: safeInt(1), sha256: sha256Schema }).strict();
 
 const datasetRefSchema = z
   .object({
     id: z.string().regex(COMPUTE_DATASET_ID_RE),
     version: z.string().regex(COMPUTE_DATASET_VERSION_RE),
-    include: z.array(processText(computeGlobSchema)).max(64).optional(),
+    include: z
+      .array(processText(computeGlobSchema).superRefine(refuseBadInclude))
+      .max(64)
+      .optional()
+      .describe(COMPUTE_INCLUDE_DESCRIPTION),
   })
   .strict();
 
@@ -567,9 +695,10 @@ export function launchVariableBytes(spec: {
  * {@link JobSpecSchema} rather than by per-field caps: a non-ASCII character costs six bytes once
  * escaped, so no per-field cap that is generous for ASCII could also be safe for any mix. The
  * variable part may take 48 KiB; the rest of the document, at its own worst case (a 512-character
- * `api_base` and image reference, a 256-character token and `sif`, twenty datasets of 64-character
- * versions, the keys and brackets), is about 4 KiB, which `launchSpecFits` and a test check; the bound leaves
- * the rest of the 64 KiB as slack for a field that grows.
+ * `api_base` and image reference, a 256-character token, the 68-character image file name, twenty
+ * datasets of 64-character tags, the keys and brackets), is under 4 KiB, which `launchSpecFits`
+ * and a test check; the bound leaves the rest of the 64 KiB as slack for a field that grows. This
+ * is about size only: whether a dataset version has a tag is {@link datasetVersionWithoutTag}'s.
  */
 export const LAUNCH_VARIABLE_BYTES_MAX = 49_152;
 
@@ -582,10 +711,37 @@ export const LAUNCH_VARIABLE_BYTES_MAX = 49_152;
  * The output directory is `outputs`, which the launcher's layout fixes (`work/outputs/`). `matlab`
  * is a valid specification; a route refuses it as `runtime_unavailable` until it is licensed.
  *
- * A valid specification always becomes a launch specification a process can use: it fits the 64 KiB
- * (see {@link LAUNCH_VARIABLE_BYTES_MAX}) and every string that reaches a process is well-formed
- * UTF-16 (see {@link computeIsWellFormed}), each refused here, with the field named by its path,
- * rather than after the hold exists.
+ * How the code runs, which is the contract the launcher keeps (its texts are
+ * {@link COMPUTE_ENTRY_DESCRIPTION}, {@link COMPUTE_COMMAND_DESCRIPTION} and
+ * {@link COMPUTE_ARGS_DESCRIPTION}): `runtime: python` with an `entry` runs `python /code/<entry>`
+ * followed by `args`; a `command` runs as given with `args` appended; `runtime: image` with an
+ * `entry` is allowed and runs `/code/<entry>` directly, which needs the executable bit that the
+ * bundle packer must preserve; the runtime image must provide `python` on its PATH for the python
+ * runtime. A bundle archive's member names may carry a leading `./`; absolute names, `..`, links,
+ * devices and FIFOs are refused by the launcher.
+ *
+ * A dataset's `include` patterns are matched against manifest paths relative to the dataset root
+ * ({@link COMPUTE_INCLUDE_DESCRIPTION}): `**` followed by `/` matches zero or more directories; `**`
+ * elsewhere matches any run of characters including `/`; `*` and `?` stay inside one path segment;
+ * `[abc]`, `[a-c]` and `[!abc]` are classes; a character class never matches `/`, so like `*` and `?`
+ * it stays inside one path segment, and a negated class `[!a]` matches any single character except
+ * `a` and `/`; an unterminated `[` is a literal `[`; an empty class
+ * `[]` and an inverted range such as `[z-a]` are refused (`includePatternProblem`, which this
+ * schema applies, so the launcher's `bad_include` is exactly the set of patterns the dialect
+ * refuses); matching is case-sensitive; there are no escapes; and a matcher must run in time linear
+ * in the pattern length times the path length (no backtracking).
+ * There is no cap on how many wildcards a pattern holds. A dataset's `version` is what a person
+ * writes (`1.0.2`); the Worker writes the data-plane tag for the launch specification
+ * (`dataTagForVersion`).
+ *
+ * A valid job specification always fits the 64 KiB launch specification (see
+ * {@link LAUNCH_VARIABLE_BYTES_MAX}) and is well formed: every string that reaches a process is
+ * well-formed UTF-16 (see {@link computeIsWellFormed}), each refused here, with the field named by
+ * its path, rather than after the hold exists; the dataset version tag is the one launch rule
+ * JobSpecSchema does not enforce: a version such as `1.0`, `abc`, `V1.0.2` or `2.0.0-rc.1` is valid
+ * for a job and has no data-plane tag, so the Worker and the CLI must run `launchSpecFits` (and
+ * refuse with `invalid_spec`, naming the field {@link datasetVersionWithoutTag} finds) BEFORE the
+ * hold.
  *
  * Two digests are named apart. `spec_digest` is the JOB ROW's digest of this document: the SHA-256,
  * in lowercase hex, of the exact bytes of `records/<id>/spec.json` (set by phase A3). It is not a
@@ -596,13 +752,14 @@ export const JobSpecSchema = z
   .object({
     name: z.string().regex(JOB_NAME_RE),
     runtime: z.enum(JOB_RUNTIMES),
-    entry: processText(relativePath(240)).optional(),
+    entry: processText(relativePath(240)).optional().describe(COMPUTE_ENTRY_DESCRIPTION),
     command: z
       .array(processText(z.string().min(1).max(1024)))
       .min(1)
       .max(64)
-      .optional(),
-    args: z.array(argSchema).max(64).default([]),
+      .optional()
+      .describe(COMPUTE_COMMAND_DESCRIPTION),
+    args: z.array(argSchema).max(64).default([]).describe(COMPUTE_ARGS_DESCRIPTION),
     bundle: bundleRefSchema.optional(),
     datasets: z.array(datasetRefSchema).max(20).default([]),
     partition: z.enum(PARTITION_NAMES),
