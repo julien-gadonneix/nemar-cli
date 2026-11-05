@@ -4,14 +4,16 @@
  * the real ledger, Miniflare's R2 through the Worker's own bindings, the real local S3 interface, and
  * the Tapis stand-in (a real HTTP server built from Tapis's published specifications; NO RESPONSE IN IT
  * WAS RECORDED FROM A REAL TENANT). The launcher is played by the test (`compute-lifecycle-fixture.ts`):
- * it hashes the launch specification value the Tapis stand-in RECEIVED, never the digest the Worker
- * stored, so the digest check proves something.
+ * it decodes the launch specification value the Tapis stand-in RECEIVED (base64url, strictly, as the
+ * launcher does) and hashes the TEXT, never the digest the Worker stored, so the digest check proves
+ * something.
  *
  * What is pinned, each with a test of its own:
  *  - a job is submitted ONCE: the hold exists, the request names no archive field and asks Tapis not to
  *    archive the launch files, the owner is the NEMAR service identity from configuration, the launch
- *    specification (token and all) is in the one environment variable and nowhere in D1, its SHA-256 is
- *    written to the row BEFORE the call, and a webhook is subscribed;
+ *    specification (token and all) is in the one environment variable, as base64url text that a shell
+ *    sources intact even for shell-active arguments, and nowhere in D1; the SHA-256 written to the row
+ *    BEFORE the call is of the TEXT, not of the value; and a webhook is subscribed;
  *  - a submit whose answer was lost finds its job by tag and submits once (MUTATION: skip the tag
  *    search and the stand-in sees two submits); a rejection fails the job and releases the hold; an
  *    unavailable Tapis leaves it `created`; two jobs under one tag submit nothing and flag the job;
@@ -35,7 +37,13 @@ import {
   DEFAULT_COMPUTE_POLICY,
   RECORDS_RESULT_MANIFEST_FILE,
 } from "../../shared/contract/compute";
-import { LaunchSpecSchema, encodeLaunchSpec } from "../../shared/contract/compute-launch";
+import {
+  LaunchSpecSchema,
+  decodeLaunchSpecEnv,
+  encodeLaunchSpec,
+  encodeLaunchSpecEnv,
+  isShellInertEnvValue,
+} from "../../shared/contract/compute-launch";
 import { resultsLauncherKey, resultsOutputKey } from "../../shared/contract/compute-launch";
 import { ADVANCE_ROWS_PER_TICK, runComputeAdvanceCron } from "../src/services/compute-advance";
 import { sweepComputeCancellations } from "../src/services/compute-advance";
@@ -69,7 +77,8 @@ import {
   RUNTIME_IMAGE_DIGEST,
   iso,
   jobTokenSeenByTapis,
-  launchSpecSeenByTapis,
+  launchSpecEnvSeenByTapis,
+  launchSpecTextSeenByTapis,
   makeJob,
   playLauncher,
   reread,
@@ -78,7 +87,9 @@ import {
   startLifecycleFixture,
 } from "./helpers/compute-lifecycle-fixture";
 import { roundTripD1, seedUser } from "./helpers/compute-seed";
+import { launchSecretForms } from "./helpers/launch-secret-forms";
 import { logged } from "./helpers/logs";
+import { makeSandbox, sourceLaunchFile } from "./helpers/scheduler-launch-file";
 
 let fx: LifecycleFixture;
 /** An owner of the Miniflare D1, which is never reset. */
@@ -208,9 +219,14 @@ describe("submit", () => {
     expect(body.maxMinutes).toBe(60);
     expect(body.parameterSet.envVariables).toHaveLength(1);
     expect(body.parameterSet.envVariables[0].key).toBe("NEMAR_LAUNCH_SPEC");
+    // The value is shell-inert: base64url text, nothing a shell or a conditional quoter acts on (A1c).
+    const value = body.parameterSet.envVariables[0].value as string;
+    expect(isShellInertEnvValue(value)).toBe(true);
+    expect(value.startsWith("{")).toBe(false);
+    expect(value).toBe(launchSpecEnvSeenByTapis(fx, job.tapis_uuid as string));
 
-    // The launch specification the launcher will read.
-    const text = launchSpecSeenByTapis(fx, job.tapis_uuid as string);
+    // The launch specification the launcher will read: what it decodes the value to.
+    const text = launchSpecTextSeenByTapis(fx, job.tapis_uuid as string);
     const spec = LaunchSpecSchema.parse(JSON.parse(text));
     expect(spec.job_id).toBe(job.id);
     expect(spec.datasets).toEqual([{ id: "nm000104", version: "v1.0.2" }]);
@@ -222,9 +238,12 @@ describe("submit", () => {
     expect(spec.command).toEqual(["analyse", "--fast"]);
     expect(spec.resources).toEqual({ gpus: 0 });
     expect(spec.api_base).toBe("http://127.0.0.1:9");
-    // Its text is exactly what `encodeLaunchSpec` writes, and its digest is what the row holds.
+    // Its text is exactly what `encodeLaunchSpec` writes, the value is that text in base64url, and the
+    // digest the row holds is of the TEXT the launcher decodes: never of the value that was sent.
     expect(text).toBe(encodeLaunchSpec(spec));
+    expect(value).toBe(encodeLaunchSpecEnv(text));
     expect(job.launch_spec_digest).toBe(await sha256Hex(new TextEncoder().encode(text)));
+    expect(job.launch_spec_digest).not.toBe(await sha256Hex(new TextEncoder().encode(value)));
     // The job's runtime image is recorded, because it is what ran.
     expect(job.image_digest).toBe(RUNTIME_IMAGE_DIGEST);
 
@@ -252,7 +271,11 @@ describe("submit", () => {
       ledger: (await made.env.DB.prepare("SELECT * FROM compute_ledger").all()).results,
       audit: (await made.env.DB.prepare("SELECT * FROM audit_log").all()).results,
     });
-    expect(everything).not.toContain(spec.job_token);
+    // Every form of the token: the plain token, the whole encoded value, and the token's base64url text
+    // at each alignment (the plain token is no longer a substring of the value, nor of a slice of it).
+    launchSecretForms(spec.job_token, value).forEach((form, i) => {
+      expect(everything.includes(form), `form ${i} of the token`).toBe(false);
+    });
     expect(everything).not.toContain("NEMAR_LAUNCH_SPEC");
 
     // One webhook subscription, carrying a token that is a different kind from the job's.
@@ -367,9 +390,53 @@ describe("submit", () => {
     expect(job.launch_spec_digest).toBe(stored as string);
     expect(job.launch_spec_digest).toBe(
       await sha256Hex(
-        new TextEncoder().encode(launchSpecSeenByTapis(fx, job.tapis_uuid as string)),
+        new TextEncoder().encode(launchSpecTextSeenByTapis(fx, job.tapis_uuid as string)),
       ),
     );
+  });
+
+  test("a job with shell-active arguments is sent as a value a shell sources back intact, and nothing it holds runs (A1c)", async () => {
+    // The scheduler is read as writing the value into a file a shell sources, quoting it only
+    // conditionally (`scheduler-launch-file.ts`; unverified). Every string below is inert: a command,
+    // if it ran, only makes a file in a fresh directory, which is listed afterwards.
+    const sandbox = makeSandbox();
+    try {
+      const args = [
+        "a b",
+        `$(touch ${sandbox.sentinel})`,
+        `$(touch ${sandbox.relativeSentinel})`,
+        `\`touch ${sandbox.sentinel}\``,
+        'say "hi"',
+        "C:\\dir\\file",
+        "a;b&c|d<e>f",
+        "line1\nline2",
+        "$HOME ${PATH} $$",
+        "~ * ? [a-z] ! #",
+        "caf\u00e9 \u{1F600}",
+      ];
+      const made = await makeJob(fx, { spec: { args } });
+      expect(await submitComputeJob(made.env, made.job.id)).toEqual({
+        ok: true,
+        outcome: "submitted",
+      });
+      const job = await reread(made.env, made.job.id);
+      const uuid = job.tapis_uuid as string;
+
+      // What Tapis received, put through the scheduler's quoting and a real shell.
+      const value = launchSpecEnvSeenByTapis(fx, uuid);
+      const sourced = sourceLaunchFile(value, sandbox);
+      expect(sourced.intact).toBe(true);
+      expect(sourced.made).toEqual([]);
+
+      // And what the launcher then does with it: decode, hash the text, parse. The arguments are intact.
+      const decoded = decodeLaunchSpecEnv(sourced.seen);
+      expect(decoded.ok).toBe(true);
+      const text = decoded.ok ? decoded.text : "";
+      expect(LaunchSpecSchema.parse(JSON.parse(text)).args).toEqual(args);
+      expect(job.launch_spec_digest).toBe(await sha256Hex(new TextEncoder().encode(text)));
+    } finally {
+      sandbox.remove();
+    }
   });
 
   test("a retry that finds nothing rebuilds the specification and overwrites the digest before it submits", async () => {
@@ -387,7 +454,7 @@ describe("submit", () => {
     expect(job.launch_spec_digest).not.toBe(first);
     expect(job.launch_spec_digest).toBe(
       await sha256Hex(
-        new TextEncoder().encode(launchSpecSeenByTapis(fx, job.tapis_uuid as string)),
+        new TextEncoder().encode(launchSpecTextSeenByTapis(fx, job.tapis_uuid as string)),
       ),
     );
     expect(job.image_digest).toBe(`sha256:${"c".repeat(64)}`);
@@ -456,7 +523,7 @@ describe("submit", () => {
       coresPerNode: 1,
       gpus: 0,
       minutes: 5,
-      launchSpec: "x",
+      launchSpecEnv: encodeLaunchSpecEnv("x"),
     };
     await submitJob(ctx, input);
     await submitJob(ctx, input);
@@ -485,7 +552,7 @@ describe("submit", () => {
       coresPerNode: 4,
       gpus: 0,
       minutes: 60,
-      launchSpec: "x",
+      launchSpecEnv: encodeLaunchSpecEnv("x"),
     });
     fx.tapis.advance(rec.uuid, "RUNNING");
     expect(await submitComputeJob(made.env, made.job.id)).toEqual({ ok: true, outcome: "bound" });
@@ -582,7 +649,7 @@ describe("submit", () => {
     expect(await submitComputeJob(env, made.job.id)).toEqual({ ok: true, outcome: "submitted" });
     const job = await reread(made.env, made.job.id);
     const spec = LaunchSpecSchema.parse(
-      JSON.parse(launchSpecSeenByTapis(fx, job.tapis_uuid as string)),
+      JSON.parse(launchSpecTextSeenByTapis(fx, job.tapis_uuid as string)),
     );
     // Written out, not computed with the contract's own function.
     expect(spec.image).toEqual({
@@ -605,7 +672,7 @@ describe("submit", () => {
     });
     const job = await reread(made.env, made.job.id);
     const spec = LaunchSpecSchema.parse(
-      JSON.parse(launchSpecSeenByTapis(fx, job.tapis_uuid as string)),
+      JSON.parse(launchSpecTextSeenByTapis(fx, job.tapis_uuid as string)),
     );
     expect(spec.runtime).toBe("image");
     expect(spec.image).toEqual({ uri: image, digest, sif: `${"d".repeat(64)}.sif` });
@@ -2161,20 +2228,37 @@ describe("the 30-minute tick", () => {
 describe("logs", () => {
   test("no token, address, path, secret or job output reaches a log, through a full lifecycle with failures", async () => {
     let token = "";
+    let launchValue = "";
+    let otherToken = "";
+    let otherLaunchValue = "";
     const lines = await logged(async () => {
       const s = await submittedJob();
       token = jobTokenSeenByTapis(fx, s.uuid);
+      launchValue = launchSpecEnvSeenByTapis(fx, s.uuid);
       fx.tapis.fail("GET /v3/jobs/:uuid", 503);
       await advanceComputeJob(s.env, s.made.job.id);
       await finishJob(s, { outputs: [{ path: "secret-name-path.txt", content: "x" }] });
       fx.tapis.fail("POST /v3/jobs/submit", 503);
       const other = await makeJob(fx);
       await submitComputeJob(other.env, other.job.id);
+      // The failed submit built the launch value and logged `submit_unclear`: it is that job's secrets a
+      // leak there would carry. A retry succeeds, and the token is a function of the job and its nonce,
+      // so the stand-in then holds exactly the value the failed attempt built.
+      expect(await submitComputeJob(other.env, other.job.id)).toMatchObject({ ok: true });
+      const sent = (await reread(other.env, other.job.id)).tapis_uuid as string;
+      otherToken = jobTokenSeenByTapis(fx, sent);
+      otherLaunchValue = launchSpecEnvSeenByTapis(fx, sent);
     });
     const joined = lines.join("\n");
     expect(token).toMatch(/^[0-9a-f]{64}$/);
+    expect(otherToken).toMatch(/^[0-9a-f]{64}$/);
+    // The encoded launch value holds the token, and the plain token is no longer a substring of it.
+    expect(isShellInertEnvValue(launchValue)).toBe(true);
+    expect(isShellInertEnvValue(otherLaunchValue)).toBe(true);
     const forbidden = [
-      token,
+      // Each job's token in every form: plain, the whole encoded value, and its three alignments.
+      ...launchSecretForms(token, launchValue),
+      ...launchSecretForms(otherToken, otherLaunchValue),
       CALLBACK_SECRET,
       "secret-name-path.txt",
       fx.tapis.password,

@@ -12,7 +12,8 @@
  *
  * WHO CAN READ A JOB'S `parameterSet`, and with it the job's token (from the Jobs specification and
  * documentation; ALL OF IT UNVERIFIED against a real tenant). The launch specification, which holds
- * `job_token`, travels in the environment variable `NEMAR_LAUNCH_SPEC`, which Tapis keeps in the job
+ * `job_token`, travels in the environment variable `NEMAR_LAUNCH_SPEC` as base64url text (A1c; an
+ * encoding for the shell, not a protection: the value holds the token), which Tapis keeps in the job
  * record's `parameterSet.envVariables`. The roles that can read it are: the job's owner, its creator
  * (`createdby`) and a tenant administrator, through `GET /v3/jobs/{uuid}` and the search with every
  * attribute; a user the job's `JOB_HISTORY` resource was shared with (the documentation says that
@@ -46,6 +47,7 @@ import {
   type PartitionName,
   isSafeComputePath,
 } from "../../../../shared/contract/compute";
+import type { LaunchSpecEnvValue } from "../../../../shared/contract/compute-launch";
 import { withRetry } from "../retry";
 import { getTapisToken, invalidateTapisToken, requireTapisConfig } from "./auth";
 import { type TapisEnv, overrideActive, tapisBaseOrProblem } from "./config";
@@ -312,12 +314,43 @@ export interface SubmitJobInput {
   memoryMb?: number;
   gpus: number;
   minutes: number;
-  /** The exact text of `NEMAR_LAUNCH_SPEC` (`encodeLaunchSpec`): printable ASCII, within 64 KiB. */
-  launchSpec: string;
+  /**
+   * The VALUE of `NEMAR_LAUNCH_SPEC`, as `encodeLaunchSpecEnv` returns it: the launch specification's
+   * text in base64url, shell-inert characters only and within 87,382 of them. The type is branded, so
+   * the text cannot be passed in its place; raw JSON, or anything else that is not such a value, is
+   * refused before a request is built. It holds the job's token, so it is never logged or returned.
+   */
+  launchSpecEnv: LaunchSpecEnvValue;
+}
+
+/** Which part of a submit request NEMAR refused to send: the launch value, or another field of the job. */
+export type SubmitRefusalReason = "launch_spec_env" | "job_field";
+
+/**
+ * A submit request NEMAR will not send because of the job's own data: the launch value, or a field that
+ * comes from the job's row. Such a request is wrong the same way on every attempt, so a caller ends the
+ * job instead of retrying it; `reason` is a fixed word saying which part. It is a RangeError, as a
+ * refused request always was. The OWNER is not such a field: it is NEMAR's configuration, a bad one is
+ * fixed there, and it stays a plain RangeError, so the job waits for the fix. The message names the
+ * fields and never a value, because the launch value holds the job's token.
+ */
+export class SubmitRequestRefused extends RangeError {
+  readonly reason: SubmitRefusalReason;
+
+  constructor(reason: SubmitRefusalReason, fields: string[]) {
+    super(`the job request is not one NEMAR sends: ${fields.join(", ")}`);
+    this.name = "SubmitRequestRefused";
+    this.reason = reason;
+  }
 }
 
 /** The request `submitJob` sends, so a test and a reader see exactly what it is. */
 export function buildSubmitRequest(owner: string, input: SubmitJobInput) {
+  // The tag below is made from the job id, and refuses one that is not a job id by a plain RangeError:
+  // refuse it first, as the job's own data.
+  if (typeof input.jobId !== "string" || !COMPUTE_JOB_ID_RE.test(input.jobId)) {
+    throw new SubmitRequestRefused("job_field", ["name"]);
+  }
   const candidate = {
     name: input.jobId,
     appId: input.appId,
@@ -329,7 +362,7 @@ export function buildSubmitRequest(owner: string, input: SubmitJobInput) {
     ...(input.memoryMb === undefined ? {} : { memoryMB: input.memoryMb }),
     maxMinutes: input.minutes,
     parameterSet: {
-      envVariables: [{ key: LAUNCH_SPEC_ENV_KEY, value: input.launchSpec }],
+      envVariables: [{ key: LAUNCH_SPEC_ENV_KEY, value: input.launchSpecEnv }],
       // Tapis archives `tapisjob.env` (which holds the launch specification, so the job's token) and
       // `tapisjob.sh` with the job's output unless told not to. The application definition says the
       // same, as a second layer. Whether Tapis takes this from the request is UNVERIFIED.
@@ -342,15 +375,18 @@ export function buildSubmitRequest(owner: string, input: SubmitJobInput) {
     tags: [nemarJobTag(input.jobId)],
   };
   if (!Number.isInteger(input.gpus) || input.gpus < 0) {
-    throw new RangeError("gpus is a whole number from 0");
+    throw new SubmitRequestRefused("job_field", ["gpus"]);
   }
   const checked = SubmitJobRequestSchema.safeParse(candidate);
   if (!checked.success) {
     // The fields, never the values: a launch specification holds a token.
-    const fields = checked.error.issues.map((i) => i.path.join(".") || "request");
-    throw new RangeError(
-      `the job request is not one NEMAR sends: ${[...new Set(fields)].join(", ")}`,
-    );
+    const fields = [...new Set(checked.error.issues.map((i) => i.path.join(".") || "request"))];
+    // The owner is configuration, not the job's data: a plain RangeError, and the job waits.
+    if (fields.includes("owner")) {
+      throw new RangeError(`the job request is not one NEMAR sends: ${fields.join(", ")}`);
+    }
+    const launchValue = fields.some((field) => field.startsWith("parameterSet.envVariables"));
+    throw new SubmitRequestRefused(launchValue ? "launch_spec_env" : "job_field", fields);
   }
   return checked.data;
 }

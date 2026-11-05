@@ -77,12 +77,18 @@ import {
 import {
   BundleResponseSchema,
   LAUNCH_RUNTIMES,
+  LAUNCH_SPEC_ENV_MAX_CHARS,
+  LAUNCH_SPEC_ENV_REFUSALS,
   LAUNCH_SPEC_MAX_BYTES,
   LAUNCH_SPEC_VERSION,
   LaunchSpecSchema,
   OutputsRequestSchema,
   OutputsResponseSchema,
+  SHELL_INERT_ENV_ALPHABET,
+  decodeLaunchSpecEnv,
   encodeLaunchSpec,
+  encodeLaunchSpecEnv,
+  isShellInertEnvValue,
   launchSpecFits,
   resultsLauncherKey,
   resultsOutputKey,
@@ -2400,6 +2406,8 @@ describe("the launch specification", () => {
     expect(LAUNCH_SPEC_VERSION).toBe("nemar.launch-spec.v1");
     expect([...LAUNCH_RUNTIMES]).toEqual(["python", "image"]);
     expect(LAUNCH_SPEC_MAX_BYTES).toBe(64 * 1024);
+    // The value on the wire is the text in base64url: 87,382 characters for 65,536 bytes (A1c).
+    expect(LAUNCH_SPEC_ENV_MAX_CHARS).toBe(87_382);
     expect(LAUNCHER_ENV.SPEC).toBe("NEMAR_LAUNCH_SPEC");
   });
 
@@ -3023,6 +3031,12 @@ describe("a valid job specification always fits the 64 KiB launch specification 
         expect(launchSpecFits({ ...job, args: argsReaching(job, LAUNCH_SPEC_MAX_BYTES) })).toBe(
           true,
         );
+        // The document at the cap is the value at its bound, shell-inert, and it decodes back (A1c).
+        const atCap = workerWorstCase({ ...job, args: argsReaching(job, LAUNCH_SPEC_MAX_BYTES) });
+        const value = encodeLaunchSpecEnv(atCap);
+        expect(value.length).toBe(LAUNCH_SPEC_ENV_MAX_CHARS);
+        expect(isShellInertEnvValue(value)).toBe(true);
+        expect(decodeLaunchSpecEnv(value)).toEqual({ ok: true, text: atCap });
         expect(launchSpecFits({ ...job, args: argsReaching(job, LAUNCH_SPEC_MAX_BYTES - 1) })).toBe(
           true,
         );
@@ -3244,8 +3258,9 @@ describe("what an entry, a command, args and an include pattern mean is part of 
 describe("the golden vector nemar-process checks its launcher against", () => {
   // One fixed launch specification with a non-ASCII character, a double quote and a space in its
   // arguments, the exact text encodeLaunchSpec writes for it and the SHA-256 of that text, all as
-  // literals. The launcher hashes the raw bytes of NEMAR_LAUNCH_SPEC before it parses them, so it
-  // must report GOLDEN_SHA256 for GOLDEN_TEXT and parse the text back to GOLDEN_SPEC.
+  // literals. The environment value is that text in base64url (see the encoded vectors below), and
+  // the launcher decodes it and hashes the DECODED text before it parses it, so it must report
+  // GOLDEN_SHA256 for GOLDEN_TEXT and parse the text back to GOLDEN_SPEC.
   const GOLDEN_SPEC = {
     job_id: "job_0123456789abcdef01234567",
     runtime: "python",
@@ -3281,6 +3296,592 @@ describe("the golden vector nemar-process checks its launcher against", () => {
 
   test("the text carries the three awkward characters as the schema says", () => {
     expect(GOLDEN_TEXT).toContain(String.raw`caf\u00e9 \"q\" \ud83d\ude00`);
+  });
+
+  // THE ENCODED VECTORS (A1c, #2043): the value `NEMAR_LAUNCH_SPEC` carries for a text, as literals,
+  // with its length and the SHA-256 of the value's own ASCII bytes. The launcher's decoder is held
+  // to the same strings in nemar-process. The digests above stay over the TEXT: `spec` digests are
+  // never over a value, and GOLDEN_ENV_SHA256 is a different number from GOLDEN_SHA256 on purpose.
+  const GOLDEN_ENV =
+    "eyJqb2JfaWQiOiJqb2JfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwicnVudGltZSI6InB5dGhvbiIsImVudHJ5IjoicnVuLnB5IiwiYXJncyI6WyItLWxhYmVsIiwiY2FmXHUwMGU5IFwicVwiIFx1ZDgzZFx1ZGUwMCJdLCJidW5kbGUiOnsic2hhMjU2IjoiYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYSIsInNpemUiOjEyMzR9LCJkYXRhc2V0cyI6W3siaWQiOiJubTAwMDEwNCIsInZlcnNpb24iOiJ2MS4wLjIifV0sImFwaV9iYXNlIjoiaHR0cHM6Ly9hcGkuZXhhbXBsZS50ZXN0IiwiaW1hZ2UiOnsidXJpIjoiZG9ja2VyOi8vZ2hjci5pby9leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJkaWdlc3QiOiJzaGEyNTY6YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsInNpZiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIuc2lmIn0sImVudiI6eyJPTVBfTlVNX1RIUkVBRFMiOiI0In0sInJlc291cmNlcyI6eyJncHVzIjowfSwibGltaXRzIjp7Im1heF9maWxlcyI6MzgwMDAsIm1heF90b3RhbF9ieXRlcyI6MTA3Mzc0MTgyNH0sImpvYl90b2tlbiI6InR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHQifQ";
+  const GOLDEN_ENV_LENGTH = 1022;
+  const GOLDEN_ENV_SHA256 = "b20fae0dfbe428d0b8f37b52741abc52567b99674cd1b531ee53d9b6e8e36e26";
+
+  test("the encoded golden value is the golden text in base64url, to the byte", () => {
+    expect(encodeLaunchSpecEnv(GOLDEN_TEXT)).toBe(GOLDEN_ENV);
+    expect(encodeLaunchSpecEnv(encodeLaunchSpec(GOLDEN_SPEC))).toBe(GOLDEN_ENV);
+    expect(GOLDEN_ENV.length).toBe(GOLDEN_ENV_LENGTH);
+    // 766 bytes is 255 groups of three and one byte left over: 1020 characters plus two, no padding.
+    expect(GOLDEN_ENV_LENGTH).toBe(Math.ceil((GOLDEN_TEXT.length * 4) / 3));
+    expect(createHash("sha256").update(GOLDEN_ENV, "ascii").digest("hex")).toBe(GOLDEN_ENV_SHA256);
+    // An independent oracle for the same bytes (Node's own base64url, which writes no padding).
+    expect(Buffer.from(GOLDEN_TEXT, "ascii").toString("base64url")).toBe(GOLDEN_ENV);
+  });
+
+  test("the encoded golden value is shell-inert, and the digest of the value is not the digest of the text", () => {
+    expect(isShellInertEnvValue(GOLDEN_ENV)).toBe(true);
+    expect(GOLDEN_ENV.length).toBeLessThanOrEqual(LAUNCH_SPEC_ENV_MAX_CHARS);
+    expect(GOLDEN_ENV_SHA256).not.toBe(GOLDEN_SHA256);
+  });
+
+  test("the launcher's route back: the value decodes to the golden text, which hashes to the golden digest and parses to the specification", () => {
+    const decoded = decodeLaunchSpecEnv(GOLDEN_ENV);
+    expect(decoded).toEqual({ ok: true, text: GOLDEN_TEXT });
+    const text = decoded.ok ? decoded.text : "";
+    expect(createHash("sha256").update(text, "ascii").digest("hex")).toBe(GOLDEN_SHA256);
+    expect(JSON.parse(text)).toEqual(GOLDEN_SPEC);
+  });
+
+  // The first vector's value happens to hold neither `-` nor `_`, the two characters base64url
+  // writes where base64 writes `+` and `/`. This one is chosen so that it holds both, and its
+  // arguments carry what a shell treats as special: it pins the substitution, not only the rest.
+  const URLSAFE_SPEC = {
+    job_id: "job_0123456789abcdef01234567",
+    runtime: "python",
+    command: ["python3", "-c"],
+    args: ["print($(id))", "`x`;&|<>", "a\\b", "\n\t", ">>>???~~~"],
+    datasets: [],
+    api_base: "https://api.example.test",
+    image: {
+      uri: `docker://ghcr.io/example/runtime@sha256:${"b".repeat(64)}`,
+      digest: `sha256:${"b".repeat(64)}`,
+      sif: `${"b".repeat(64)}.sif`,
+    },
+    env: {},
+    resources: { gpus: 0 },
+    limits: { max_files: 38000, max_total_bytes: 1073741824 },
+    job_token: "t".repeat(43),
+  };
+  // Written as a single-quoted string: the JSON text holds double quotes, backslashes and a backtick,
+  // and no apostrophe, so each is one escape level away from the text itself.
+  const URLSAFE_TEXT =
+    '{"job_id":"job_0123456789abcdef01234567","runtime":"python","command":["python3","-c"],"args":["print($(id))","`x`;&|<>","a\\\\b","\\n\\t",">>>???~~~"],"datasets":[],"api_base":"https://api.example.test","image":{"uri":"docker://ghcr.io/example/runtime@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","digest":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","sif":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb.sif"},"env":{},"resources":{"gpus":0},"limits":{"max_files":38000,"max_total_bytes":1073741824},"job_token":"ttttttttttttttttttttttttttttttttttttttttttt"}';
+  const URLSAFE_SHA256 = "501b92700038336d2579133ce14f3664bca06827f120be07d079ace09722f91e";
+  const URLSAFE_ENV =
+    "eyJqb2JfaWQiOiJqb2JfMDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3IiwicnVudGltZSI6InB5dGhvbiIsImNvbW1hbmQiOlsicHl0aG9uMyIsIi1jIl0sImFyZ3MiOlsicHJpbnQoJChpZCkpIiwiYHhgOyZ8PD4iLCJhXFxiIiwiXG5cdCIsIj4-Pj8_P35-fiJdLCJkYXRhc2V0cyI6W10sImFwaV9iYXNlIjoiaHR0cHM6Ly9hcGkuZXhhbXBsZS50ZXN0IiwiaW1hZ2UiOnsidXJpIjoiZG9ja2VyOi8vZ2hjci5pby9leGFtcGxlL3J1bnRpbWVAc2hhMjU2OmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIiLCJkaWdlc3QiOiJzaGEyNTY6YmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYiIsInNpZiI6ImJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmJiYmIuc2lmIn0sImVudiI6e30sInJlc291cmNlcyI6eyJncHVzIjowfSwibGltaXRzIjp7Im1heF9maWxlcyI6MzgwMDAsIm1heF90b3RhbF9ieXRlcyI6MTA3Mzc0MTgyNH0sImpvYl90b2tlbiI6InR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHR0dHQifQ";
+  const URLSAFE_ENV_SHA256 = "073876511ad06a09f389b7207311fc906ca0c78e05397414bb2d32f31c85273e";
+
+  test("a second vector holds both url-safe characters, and the standard alphabet's two never appear", () => {
+    expect(encodeLaunchSpec(URLSAFE_SPEC)).toBe(URLSAFE_TEXT);
+    expect(URLSAFE_TEXT.length).toBe(631);
+    expect(createHash("sha256").update(URLSAFE_TEXT, "ascii").digest("hex")).toBe(URLSAFE_SHA256);
+    expect(encodeLaunchSpecEnv(URLSAFE_TEXT)).toBe(URLSAFE_ENV);
+    expect(URLSAFE_ENV.length).toBe(842);
+    expect(createHash("sha256").update(URLSAFE_ENV, "ascii").digest("hex")).toBe(
+      URLSAFE_ENV_SHA256,
+    );
+    expect(URLSAFE_ENV).toContain("-");
+    expect(URLSAFE_ENV).toContain("_");
+    expect(URLSAFE_ENV).not.toMatch(/[+/=]/);
+    // The same bytes in the standard alphabet DO hold `+` and `/`: the substitution is what is pinned.
+    const standard = Buffer.from(URLSAFE_TEXT, "ascii").toString("base64");
+    expect(standard).toMatch(/\+/);
+    expect(standard).toContain("/");
+    expect(standard.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")).toBe(URLSAFE_ENV);
+    expect(decodeLaunchSpecEnv(URLSAFE_ENV)).toEqual({ ok: true, text: URLSAFE_TEXT });
+    expect(JSON.parse(URLSAFE_TEXT)).toEqual(URLSAFE_SPEC);
+    expect(isShellInertEnvValue(URLSAFE_ENV)).toBe(true);
+  });
+});
+
+// --- The launch specification on the wire (A1c, #2043) ---------------------------------------
+
+describe("the launch specification on the wire: base64url in the shell-inert alphabet", () => {
+  // The base64url alphabet of Request for Comments (RFC) 4648 section 5, in its order. Written out
+  // here, apart from the constant it checks.
+  const ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+  /** Node's own base64url, an oracle the code under test does not share a line with. */
+  const oracle = (text: string) => Buffer.from(text, "latin1").toString("base64url");
+  /** The same pseudo-random sequence on every run, so a failure can be repeated. */
+  function sequence(seed: number) {
+    let state = seed >>> 0;
+    return () => {
+      state = (Math.imul(state, 1664525) + 1013904223) >>> 0;
+      return state;
+    };
+  }
+  /** `bytes` printable ASCII characters, any of 0x20 to 0x7e: the only text the encoder takes. */
+  function printableText(next: () => number, bytes: number): string {
+    return Array.from({ length: bytes }, () => String.fromCharCode(0x20 + (next() % 95))).join("");
+  }
+
+  test("the bound is ceil(65536 * 4 / 3), 87382, and the alphabet is the 64 base64url characters", () => {
+    expect(LAUNCH_SPEC_ENV_MAX_CHARS).toBe(Math.ceil((LAUNCH_SPEC_MAX_BYTES * 4) / 3));
+    expect(LAUNCH_SPEC_ENV_MAX_CHARS).toBe(87_382);
+    expect(SHELL_INERT_ENV_ALPHABET).toBe(ALPHABET);
+    expect(new Set(SHELL_INERT_ENV_ALPHABET).size).toBe(64);
+    // The alphabet leaves out every character of base64's own padding and of its two unsafe digits.
+    for (const left of ["=", "+", "/"]) expect(SHELL_INERT_ENV_ALPHABET).not.toContain(left);
+  });
+
+  test("isShellInertEnvValue is true for exactly the alphabet, and never for the empty value", () => {
+    for (let code = 0; code < 0x300; code++) {
+      const ch = String.fromCharCode(code);
+      expect(isShellInertEnvValue(ch), `U+${code.toString(16).padStart(4, "0")}`).toBe(
+        ALPHABET.includes(ch),
+      );
+    }
+    expect(isShellInertEnvValue(ALPHABET)).toBe(true);
+    expect(isShellInertEnvValue(`${ALPHABET}${ALPHABET}`)).toBe(true);
+    expect(isShellInertEnvValue("-")).toBe(true);
+    expect(isShellInertEnvValue("")).toBe(false);
+    // Each of these is one character of the alphabet plus one that is not, in each position.
+    for (const bad of [
+      "a=",
+      "=a",
+      "a b",
+      " a",
+      "a ",
+      "a\n",
+      "\na",
+      "a\r",
+      "a\0",
+      "aé",
+      "a+b",
+      "a\u{1F600}",
+      "\ud800",
+    ]) {
+      expect(isShellInertEnvValue(bad), JSON.stringify(bad)).toBe(false);
+    }
+    for (const notText of [undefined, null, 7, {}, [], ["a"], true]) {
+      expect(isShellInertEnvValue(notText as unknown), String(notText)).toBe(false);
+    }
+  });
+
+  test("the old wire value, the JSON text itself, is not shell-inert", () => {
+    expect(isShellInertEnvValue(encodeLaunchSpec(LAUNCH))).toBe(false);
+    // Not even a document with no space in it, which a scheduler that quotes conditionally leaves bare.
+    expect(isShellInertEnvValue('{"a":1}')).toBe(false);
+  });
+
+  test("encodeLaunchSpecEnv is base64url without padding, equal to an independent oracle", () => {
+    const next = sequence(0x9e3779b9);
+    const texts = [
+      // Each of the 95 printable characters alone: 0x20 (space) to 0x7e (tilde).
+      ...Array.from({ length: 95 }, (_, i) => String.fromCharCode(0x20 + i)),
+      ...Array.from({ length: 200 }, (_, i) => printableText(next, 1 + (i % 40))),
+      ...Array.from({ length: 60 }, () => printableText(next, 1 + (next() % 3000))),
+    ];
+    for (const text of texts) {
+      const value = encodeLaunchSpecEnv(text);
+      expect(value, JSON.stringify(text)).toBe(oracle(text));
+      expect(isShellInertEnvValue(value), JSON.stringify(text)).toBe(true);
+      // ceil(n * 4 / 3): the length is a function of the byte count alone.
+      expect(value.length).toBe(Math.ceil((text.length * 4) / 3));
+      // Canonical: the unused trailing bits are zero, so Node writes back the same characters.
+      expect(Buffer.from(value, "base64url").toString("base64url")).toBe(value);
+    }
+  });
+
+  test("the bound is the cap's arithmetic: every length within 64 KiB encodes within 87382, and 65537 would not", () => {
+    // No second check in the encoder, so this is what stands in for one: ceil(n * 4 / 3) only grows,
+    // it is exactly the bound at the cap, and one byte over the cap is over the bound.
+    let previous = 0;
+    for (let bytes = 1; bytes <= LAUNCH_SPEC_MAX_BYTES; bytes++) {
+      const chars = Math.ceil((bytes * 4) / 3);
+      if (chars < previous || chars > LAUNCH_SPEC_ENV_MAX_CHARS) throw new Error(`at ${bytes}`);
+      previous = chars;
+    }
+    expect(previous).toBe(LAUNCH_SPEC_ENV_MAX_CHARS);
+    expect(Math.ceil(((LAUNCH_SPEC_MAX_BYTES + 1) * 4) / 3)).toBe(LAUNCH_SPEC_ENV_MAX_CHARS + 1);
+    // The encoder agrees with the arithmetic where it matters: the lengths around the cap.
+    for (const bytes of [65_530, 65_531, 65_532, 65_533, 65_534, 65_535, 65_536]) {
+      expect(encodeLaunchSpecEnv("a".repeat(bytes)).length, `${bytes} bytes`).toBe(
+        Math.ceil((bytes * 4) / 3),
+      );
+    }
+  });
+
+  test("a text of exactly 65536 bytes is 87382 characters and 65537 is refused by the text cap", () => {
+    const next = sequence(7);
+    const fits = printableText(next, LAUNCH_SPEC_MAX_BYTES);
+    const value = encodeLaunchSpecEnv(fits);
+    expect(value.length).toBe(LAUNCH_SPEC_ENV_MAX_CHARS);
+    expect(value).toBe(oracle(fits));
+    // One byte over is refused by the text cap, with the cap's own message, never by a second check.
+    expect(() => encodeLaunchSpecEnv(`${fits}a`)).toThrow(RangeError);
+    expect(() => encodeLaunchSpecEnv(`${fits}a`)).toThrow(
+      "the launch specification is over 64 KiB",
+    );
+  });
+
+  test("the largest launch specification, 65536 bytes of JSON, travels as 87382 characters and comes back as the same text", () => {
+    const withTail = (m: number) =>
+      set(LAUNCH, "args", [...Array.from({ length: 63 }, () => "x".repeat(1024)), "x".repeat(m)]);
+    const m = LAUNCH_SPEC_MAX_BYTES - encodeLaunchSpec(withTail(0)).length;
+    const text = encodeLaunchSpec(withTail(m));
+    expect(text.length).toBe(LAUNCH_SPEC_MAX_BYTES);
+    const value = encodeLaunchSpecEnv(text);
+    expect(value.length).toBe(LAUNCH_SPEC_ENV_MAX_CHARS);
+    expect(isShellInertEnvValue(value)).toBe(true);
+    expect(decodeLaunchSpecEnv(value)).toEqual({ ok: true, text });
+    // One byte of JSON more is refused where the text is made, before it is ever encoded.
+    expect(() => encodeLaunchSpec(withTail(m + 1))).toThrow(RangeError);
+  });
+
+  test("encodeLaunchSpecEnv refuses every byte outside 0x20 to 0x7e with a TypeError, and accepts both ends", () => {
+    // The rule is on the unit (the text is ASCII-only JSON, so a unit is a byte): a control byte, DEL,
+    // and everything from 0x80 up, alone and inside an otherwise good text.
+    for (let unit = 0; unit < 0x300; unit++) {
+      const ch = String.fromCharCode(unit);
+      const printable = unit >= 0x20 && unit <= 0x7e;
+      for (const text of [ch, `ab${ch}cd`, `${ch}abc`, `abc${ch}`]) {
+        const label = `U+${unit.toString(16).padStart(4, "0")} in ${JSON.stringify(text)}`;
+        if (printable) expect(encodeLaunchSpecEnv(text), label).toBe(oracle(text));
+        else expect(() => encodeLaunchSpecEnv(text), label).toThrow(TypeError);
+      }
+    }
+    expect(() => encodeLaunchSpecEnv("a\u{1F600}")).toThrow(TypeError);
+    // The ends of the range: the space and the tilde.
+    expect(encodeLaunchSpecEnv(" ")).toBe("IA");
+    expect(encodeLaunchSpecEnv("~")).toBe("fg");
+    // DEL, the byte just above the range, is refused (the decoder refuses it too: see below).
+    expect(() => encodeLaunchSpecEnv("\u007f")).toThrow(TypeError);
+    // Not text at all.
+    expect(() => encodeLaunchSpecEnv("")).toThrow(TypeError);
+    expect(() => encodeLaunchSpecEnv(undefined as unknown as string)).toThrow(TypeError);
+    expect(() => encodeLaunchSpecEnv(7 as unknown as string)).toThrow(TypeError);
+  });
+
+  test("no refusal of the encoder holds any part of the text, which holds a token", () => {
+    const secret = "SECRETTOKEN0123456789";
+    const refused: Array<[string, unknown]> = [
+      ["a control byte", `${secret}\u0000`],
+      ["DEL", `${secret}\u007f`],
+      ["a character from 0x80 up", `${secret}\u00e9`],
+      ["a character outside the Basic Multilingual Plane", `${secret}\u{1F600}`],
+      ["over the cap", secret.repeat(LAUNCH_SPEC_MAX_BYTES)],
+      ["not a string", { toString: () => secret }],
+    ];
+    for (const [label, text] of refused) {
+      let error: unknown;
+      try {
+        encodeLaunchSpecEnv(text as string);
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error, label).toBeInstanceOf(Error);
+      const message = (error as Error).message;
+      expect(message, label).not.toContain("SECRET");
+      expect(message, label).not.toContain("0123456789");
+    }
+  });
+
+  test("decodeLaunchSpecEnv is the inverse of encodeLaunchSpecEnv, and agrees with the oracle", () => {
+    const next = sequence(0x1234abcd);
+    for (let i = 0; i < 300; i++) {
+      const text = printableText(next, 1 + (i % 50) + (i % 7 === 0 ? next() % 2000 : 0));
+      const value = oracle(text);
+      expect(decodeLaunchSpecEnv(value), JSON.stringify(text)).toEqual({ ok: true, text });
+      expect(decodeLaunchSpecEnv(encodeLaunchSpecEnv(text))).toEqual({ ok: true, text });
+    }
+    const real = encodeLaunchSpec(LAUNCH);
+    expect(decodeLaunchSpecEnv(encodeLaunchSpecEnv(real))).toEqual({ ok: true, text: real });
+    expect(LaunchSpecSchema.parse(JSON.parse(real) as unknown)).toEqual(LAUNCH);
+  });
+
+  describe("the decoder is strict: every refusal is a fixed word", () => {
+    const refusal = (value: string) => {
+      const out = decodeLaunchSpecEnv(value);
+      return out.ok ? "ok" : out.reason;
+    };
+
+    test("an empty value", () => {
+      expect(refusal("")).toBe("empty");
+    });
+
+    test("a value over 87382 characters, though every character is in the alphabet", () => {
+      expect(refusal("A".repeat(LAUNCH_SPEC_ENV_MAX_CHARS + 1))).toBe("too_long");
+      expect(refusal("A".repeat(LAUNCH_SPEC_ENV_MAX_CHARS + 2))).toBe("too_long");
+      expect(refusal("A".repeat(LAUNCH_SPEC_ENV_MAX_CHARS + 5))).toBe("too_long");
+      // The longest accepted value is the encoding of the largest text, 64 KiB of printable ASCII.
+      const text = printableText(sequence(3), LAUNCH_SPEC_MAX_BYTES);
+      const longest = oracle(text);
+      expect(longest.length).toBe(LAUNCH_SPEC_ENV_MAX_CHARS);
+      expect(decodeLaunchSpecEnv(longest)).toEqual({ ok: true, text });
+    });
+
+    test("the unit of the length bound: an over-length ASCII value is too_long, and an over-length value with a non-ASCII character is refused with too_long or not_base64url", () => {
+      const max = LAUNCH_SPEC_ENV_MAX_CHARS;
+      // ASCII: one answer, whatever the unit, so the word is pinned. A character the alphabet lacks
+      // does not change it, because the length is checked first (it bounds the work).
+      for (const value of ["A".repeat(max + 1), "{".repeat(max + 1), `${"A".repeat(max)}=`]) {
+        expect(refusal(value), `${value.length} ASCII characters`).toBe("too_long");
+      }
+      // Non-ASCII: neither word can be told apart as the right one, because languages count a length
+      // in different units. The reference counts UTF-16 code units; a launcher may count code points
+      // or bytes. What must hold is that the value is refused, with one of the two words. Each row is
+      // over the bound in one unit and not in another, so the pair of units a launcher might use is
+      // covered: code units over and code points not (an astral character), code units not over and
+      // bytes over (a two-byte character), and over in all three.
+      const rows: Array<[string, string]> = [
+        [
+          "over in code units, not in code points (an astral character)",
+          `${"A".repeat(max - 1)}\u{1F600}`,
+        ],
+        [
+          "not over in code units, over in bytes (an e with an acute accent)",
+          `${"A".repeat(max - 1)}\u00e9`,
+        ],
+        ["over in every unit, with one accented character", `${"A".repeat(max)}\u00e9`],
+        ["over in every unit, all non-ASCII", "\u00e9".repeat(max + 1)],
+        ["all astral characters", "\u{1F600}".repeat(max)],
+        ["a non-ASCII character first", `\u00e9${"A".repeat(max)}`],
+      ];
+      for (const [label, value] of rows) {
+        const out = decodeLaunchSpecEnv(value);
+        expect(out.ok, label).toBe(false);
+        expect(["too_long", "not_base64url"], label).toContain(out.ok ? "ok" : out.reason);
+      }
+      // And a non-ASCII value that is within the bound in every unit can only be not_base64url.
+      expect(refusal("QQ\u00e9")).toBe("not_base64url");
+      expect(refusal("\u00e9".repeat(1000))).toBe("not_base64url");
+    });
+
+    test("a character outside the alphabet: padding, the standard alphabet's two, whitespace, a line break, non-ASCII", () => {
+      const cases = [
+        "QQ==",
+        "QQ=",
+        "QUI=",
+        "====",
+        "ab+/",
+        "ab+d",
+        "ab/d",
+        "ab cd",
+        " abcd",
+        "abcd ",
+        "abcd\n",
+        // A canonical value with a line break or a blank after it: not the value, whatever it decodes to.
+        "QQ\n",
+        "QQ\r\n",
+        "QQ ",
+        "QQ\t",
+        "QUI\n",
+        "\nabcd",
+        "ab\ncd",
+        "abcd\r\n",
+        "ab\tcd",
+        "abéd",
+        "abcd\u0000",
+        "ab.cd",
+        "ab,cd",
+        "ab:cd",
+        "ab$cd",
+        'ab"cd',
+        "ab'cd",
+        "ab\\cd",
+        "ab`cd",
+      ];
+      for (const value of cases)
+        expect(refusal(value), JSON.stringify(value)).toBe("not_base64url");
+      // Every other single character is outside it too, whatever the length rule says of one character.
+      for (let code = 0; code < 0x300; code++) {
+        const ch = String.fromCharCode(code);
+        if (ALPHABET.includes(ch)) continue;
+        expect(refusal(ch), `U+${code.toString(16).padStart(4, "0")}`).toBe("not_base64url");
+        expect(refusal(`QUJD${ch}`), `U+${code.toString(16).padStart(4, "0")}`).toBe(
+          "not_base64url",
+        );
+      }
+    });
+
+    test("a raw JSON value, the old wire format, is refused: nothing is registered, so there is no legacy format", () => {
+      const raw = encodeLaunchSpec(LAUNCH);
+      expect(raw.startsWith("{")).toBe(true);
+      expect(refusal(raw)).toBe("not_base64url");
+      expect(refusal("{}")).toBe("not_base64url");
+      expect(refusal("{")).toBe("not_base64url");
+      // Even a JSON document short enough, and plain enough, that it has no space in it.
+      expect(refusal('{"a":1}')).toBe("not_base64url");
+    });
+
+    test("a length that is 1 modulo 4 can be no whole number of bytes", () => {
+      for (const length of [1, 5, 9, 13, 101, 4001]) {
+        expect(refusal("A".repeat(length)), `length ${length}`).toBe("bad_length");
+      }
+      // The other three residues are fine: 0, 2 and 3 characters left over, for texts of 3n, 3n+1
+      // and 3n+2 bytes. (`AAAA` is a good length and a bad value: it is three NUL bytes.)
+      for (const bytes of [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]) {
+        const value = oracle("abcdefghijkl".slice(0, bytes));
+        expect(refusal(value), `${bytes} bytes, ${value.length} characters`).toBe("ok");
+      }
+    });
+
+    test("the padding is added back by length before decoding: two signs for 2 modulo 4, one for 3 modulo 4, none for 0", () => {
+      // The oracle is Node's base64 decoder, given the value with its padding written out by the rule.
+      const signsFor = (length: number) => ({ 0: 0, 2: 2, 3: 1 })[(length % 4) as 0 | 2 | 3];
+      const decodeWithPadding = (value: string) =>
+        Buffer.from(
+          value.replace(/-/g, "+").replace(/_/g, "/") +
+            "=".repeat(signsFor(value.length) as number),
+          "base64",
+        ).toString("latin1");
+      for (let bytes = 1; bytes <= 30; bytes++) {
+        const text = "abcdefghijklmnopqrstuvwxyz0123".slice(0, bytes);
+        const value = oracle(text);
+        expect(signsFor(value.length), `${bytes} bytes`).toBe(
+          value.length % 4 === 0 ? 0 : value.length % 4 === 2 ? 2 : 1,
+        );
+        expect(decodeWithPadding(value), `${bytes} bytes`).toBe(text);
+        expect(decodeLaunchSpecEnv(value), `${bytes} bytes`).toEqual({ ok: true, text });
+      }
+      // The three residues as fixed vectors (the golden vectors are both 2 modulo 4).
+      expect(decodeLaunchSpecEnv("QUJD")).toEqual({ ok: true, text: "ABC" }); // 0: no sign
+      expect(decodeLaunchSpecEnv("QUI")).toEqual({ ok: true, text: "AB" }); // 3: one sign
+      expect(decodeLaunchSpecEnv("QQ")).toEqual({ ok: true, text: "A" }); // 2: two signs
+      // The sender never writes the padding: a value that carries it is not a value.
+      for (const withSigns of ["QUI=", "QQ==", "QQ=", "QUJD=", "QUJD===="]) {
+        expect(refusal(withSigns), withSigns).toBe("not_base64url");
+      }
+      // A length of 1 modulo 4 is refused before the padding step, whatever follows it.
+      for (const value of ["Q", "QUJDQ", "QUJDQUJDQ"])
+        expect(refusal(value), value).toBe("bad_length");
+    });
+
+    test("a decoded byte outside 0x20 to 0x7e is refused as not printable, whichever byte it is", () => {
+      // All 256 byte values alone, each as the encoder-canonical value of that byte: only 0x20 to 0x7e
+      // (space to tilde) are text. NUL, the other control bytes and DEL (0x7f) are not, and nothing
+      // from 0x80 up is.
+      for (let byte = 0; byte < 0x100; byte++) {
+        const value = Buffer.from([byte]).toString("base64url");
+        const printable = byte >= 0x20 && byte <= 0x7e;
+        expect(refusal(value), `byte 0x${byte.toString(16).padStart(2, "0")}`).toBe(
+          printable ? "ok" : "not_printable",
+        );
+      }
+      expect(decodeLaunchSpecEnv("fg")).toEqual({ ok: true, text: "~" });
+      expect(decodeLaunchSpecEnv("IA")).toEqual({ ok: true, text: " " });
+      expect(refusal("fw")).toBe("not_printable"); // DEL, 0x7f
+      expect(refusal("AA")).toBe("not_printable"); // NUL
+      expect(refusal("gA")).toBe("not_printable"); // 0x80
+      expect(refusal("w6k")).toBe("not_printable"); // an e with an acute accent, as two UTF-8 bytes
+      expect(refusal(Buffer.from([0x41, 0xff, 0x42]).toString("base64url"))).toBe("not_printable");
+      // One bad byte at the start, the middle and the end of a long, otherwise printable, value.
+      for (const bad of [0x00, 0x0a, 0x1f, 0x7f, 0x80, 0xff]) {
+        for (const at of [0, 1499, 2999]) {
+          const bytes = Buffer.alloc(3000, 0x61);
+          bytes[at] = bad;
+          expect(refusal(bytes.toString("base64url")), `0x${bad.toString(16)} at ${at}`).toBe(
+            "not_printable",
+          );
+        }
+      }
+    });
+
+    test("an unset environment variable is a non-string: refused with not_base64url, and anything else that is not a string is too", () => {
+      // `undefined` is what reading an unset variable gives (a launcher's `None` or missing key is the same).
+      expect(refusal(undefined as unknown as string)).toBe("not_base64url");
+      for (const notText of [undefined, null, 7, {}, [], ["QUJD"], true]) {
+        expect(refusal(notText as unknown as string), String(notText)).toBe("not_base64url");
+      }
+    });
+
+    test("the words are a closed list of five, each reached, and a refusal holds no part of the value", () => {
+      expect([...LAUNCH_SPEC_ENV_REFUSALS]).toEqual([
+        "empty",
+        "too_long",
+        "not_base64url",
+        "bad_length",
+        "not_printable",
+      ]);
+      // One value per word, each made of the secret where the rule lets it be: the refusal is the
+      // word and nothing else, so none of the value can be in it.
+      const rows: Array<[string, string]> = [
+        ["", "empty"],
+        ["SECRET".repeat(20_000), "too_long"],
+        ["SECRETSECRET{", "not_base64url"],
+        ["SECRETSECRETS", "bad_length"],
+        ["SECRETSECRET", "not_printable"],
+      ];
+      for (const [value, reason] of rows) {
+        const out = decodeLaunchSpecEnv(value);
+        expect(out, reason).toEqual({ ok: false, reason });
+        expect(JSON.stringify(out), reason).not.toContain("SECRET");
+        expect(Object.keys(out).sort(), reason).toEqual(["ok", "reason"]);
+      }
+      expect(new Set(rows.map(([, reason]) => reason))).toEqual(new Set(LAUNCH_SPEC_ENV_REFUSALS));
+      const ok = decodeLaunchSpecEnv("QUJD");
+      expect(Object.keys(ok).sort()).toEqual(["ok", "text"]);
+    });
+
+    test("only the canonical value of a text is accepted: the unused trailing bits are zero", () => {
+      // "A" is the byte 0x41, two characters, and the last of them has four bits to spare. The
+      // canonical value is QQ; QR decodes to the same byte and is not the value the encoder writes.
+      expect(decodeLaunchSpecEnv("QQ")).toEqual({ ok: true, text: "A" });
+      expect(refusal("QR")).toBe("not_base64url");
+      // The same for a text of two bytes (three characters, two spare bits): QUI is canonical.
+      expect(decodeLaunchSpecEnv("QUI")).toEqual({ ok: true, text: "AB" });
+      expect(refusal("QUJ")).toBe("not_base64url");
+      // Every value of every one-byte and two-byte printable text: the spare bits of the last
+      // character take each of their values, and exactly the zero one is the encoder's. The other
+      // characters, and so the decoded bytes, do not change, so nothing but canonicity is tested.
+      const at = (ch: string) => ALPHABET.indexOf(ch);
+      const printable = Array.from({ length: 95 }, (_, i) => String.fromCharCode(0x20 + i));
+      const texts = [...printable, ...printable.flatMap((a) => printable.map((b) => `${a}${b}`))];
+      for (const text of texts) {
+        const canonical = oracle(text);
+        const spare = text.length === 1 ? 16 : 4; // 2^4 values in two characters, 2^2 in three
+        const last = canonical.slice(-1);
+        expect(at(last) % spare, JSON.stringify(text)).toBe(0);
+        for (let bits = 0; bits < spare; bits++) {
+          const value = canonical.slice(0, -1) + ALPHABET[at(last) + bits];
+          expect(refusal(value), `${JSON.stringify(text)} with spare bits ${bits}`).toBe(
+            bits === 0 ? "ok" : "not_base64url",
+          );
+        }
+      }
+    });
+
+    test("the order of the checks is fixed: a value that breaks two rules gets the word of the earlier", () => {
+      const rows: Array<[string, string, string]> = [
+        [
+          "over the bound and not in the alphabet",
+          "{".repeat(LAUNCH_SPEC_ENV_MAX_CHARS + 1),
+          "too_long",
+        ],
+        ["not in the alphabet and 1 modulo 4 long", "A{{{{", "not_base64url"],
+        ["empty is empty, not a bad value", "", "empty"],
+        ["1 modulo 4 long", "AAAAA", "bad_length"],
+        ["not printable and not canonical: AB is NUL with spare bits", "AB", "not_printable"],
+        ["printable and not canonical: QR is A with spare bits", "QR", "not_base64url"],
+      ];
+      for (const [label, value, reason] of rows) expect(refusal(value), label).toBe(reason);
+    });
+  });
+
+  describe("the JSON Schema, shared byte for byte with nemar-process, names the transport", () => {
+    // The root description says what the document is and that it travels as base64url, with the two
+    // numbers of this contract. It claims NOTHING about the scheduler, the shell or the locale: those
+    // are systems this contract does not own (an earlier sentence promised that the bytes survive
+    // them, and the review showed it false). Its words are not pinned beyond what a reader needs.
+    test("the root description names the variable, the encoding and both bounds", () => {
+      const root = launchSchema.description;
+      expect(root).toContain("NEMAR_LAUNCH_SPEC");
+      expect(root).toContain("base64url");
+      expect(root).toContain(String(LAUNCH_SPEC_MAX_BYTES));
+      expect(root).toContain(String(LAUNCH_SPEC_ENV_MAX_CHARS));
+    });
+
+    test("only the descriptions of the file changed with the wire form: its structure is the launcher phase's", () => {
+      // Everything but the text annotations, hashed. The SHA-256 is of the file as it stood before the
+      // wire form was added, so a change to a key, a type, a pattern or a bound shows here, and a change
+      // to a sentence does not. A structural change is nemar-process's to copy too: update this with it.
+      const strip = (node: unknown): unknown =>
+        Array.isArray(node)
+          ? node.map(strip)
+          : node && typeof node === "object"
+            ? Object.fromEntries(
+                Object.entries(node)
+                  .filter(([key, value]) => !(key === "description" && typeof value === "string"))
+                  .map(([key, value]) => [key, strip(value)]),
+              )
+            : node;
+      expect(
+        createHash("sha256")
+          .update(JSON.stringify(strip(launchSchema)))
+          .digest("hex"),
+      ).toBe("684334303372be174ae9b2fd60f36ad57dde5d7fa6f870979e093136c54947af");
+    });
   });
 });
 

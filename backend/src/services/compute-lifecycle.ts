@@ -63,7 +63,12 @@ import {
   resultRefusalOf,
   stateFromTapisStatus,
 } from "../../../shared/compute-state.js";
-import { encodeLaunchSpec, resultsLauncherKey } from "../../../shared/contract/compute-launch.js";
+import {
+  type LaunchSpecEnvValue,
+  encodeLaunchSpec,
+  encodeLaunchSpecEnv,
+  resultsLauncherKey,
+} from "../../../shared/contract/compute-launch.js";
 import {
   type JobSpec,
   LAUNCHER_FILES,
@@ -105,6 +110,7 @@ import {
   verifyResults,
 } from "./compute-verify.js";
 import {
+  SubmitRequestRefused,
   type TapisContext,
   type TapisJob,
   cancelJob,
@@ -280,9 +286,10 @@ export const STAMP_EXAMINED_SQL =
   "UPDATE compute_jobs SET examined_at = datetime('now') WHERE id = ?1";
 
 /**
- * The digest of the launch specification, written BEFORE the submit: `?1` the job, `?2` the digest, `?3`
- * the digest of the image the launch specification names (the runtime image can change between two
- * attempts, so a retry that finds nothing overwrites it: the row records what was last sent).
+ * The digest of the launch specification, written BEFORE the submit: `?1` the job, `?2` the digest (of
+ * the specification's JSON text, never of the base64url value sent), `?3` the digest of the image the
+ * launch specification names (the runtime image can change between two attempts, so a retry that finds
+ * nothing overwrites it: the row records what was last sent).
  */
 export const LAUNCH_DIGEST_SQL = `UPDATE compute_jobs SET
     launch_spec_digest = ?2, image_digest = ?3
@@ -989,9 +996,13 @@ const refused = (outcome: Exclude<SubmitOutcome, "submitted" | "bound" | "alread
   outcome,
 });
 
-/** The launch specification's text and what the row records of it. Never logged, never returned. */
+/**
+ * The launch specification as it is sent and what the row records of it. Never logged, never returned.
+ * `launchSpecEnv` is the `NEMAR_LAUNCH_SPEC` value (the specification's text in base64url, A1c);
+ * `digest` is the SHA-256 of the TEXT the launcher decodes it to, never of the value.
+ */
 interface BuiltLaunch {
-  text: string;
+  launchSpecEnv: LaunchSpecEnvValue;
   digest: string;
   imageDigest: string;
 }
@@ -1008,7 +1019,9 @@ type BuildResult =
  * Worker's configured runtime image for `python`, the Singularity image file named for its digest), the
  * allowlisted environment, the GPUs, the staging limits, the API base the launcher calls, and the
  * per-job token (`compute-job`, valid until the job is terminal). The text is ASCII-only JSON within 64
- * KiB (`encodeLaunchSpec`), and its SHA-256 is the `launch_spec_digest` the row records.
+ * KiB (`encodeLaunchSpec`), and its SHA-256 is the `launch_spec_digest` the row records. What is sent
+ * is that text in base64url (`encodeLaunchSpecEnv`), the shell-inert value of `NEMAR_LAUNCH_SPEC`: the
+ * digest is over the text, which is what the launcher decodes and hashes, and never over the value.
  *
  * `limits.max_total_bytes` bounds the dataset selection and NOT the outputs: the Worker's per-job
  * results limit is `resultLimits.maxJobBytes` and the outputs route enforces it; the two numbers are
@@ -1065,7 +1078,7 @@ async function buildLaunch(env: Bindings, job: ComputeJobRow): Promise<BuildResu
     return {
       ok: true,
       launch: {
-        text,
+        launchSpecEnv: encodeLaunchSpecEnv(text),
         digest: await sha256Hex(new TextEncoder().encode(text)),
         imageDigest: digest,
       },
@@ -1378,10 +1391,21 @@ async function submitLeased(
         memoryMb,
         gpus: row.gpus,
         minutes: row.minutes,
-        launchSpec: built.launch.text,
+        launchSpecEnv: built.launch.launchSpecEnv,
       },
     );
   } catch (err) {
+    if (err instanceof SubmitRequestRefused) {
+      // The job's own data (a field of its row, or the launch value) makes a request NEMAR will not send,
+      // and it is wrong the same way on every attempt. Nothing reached Tapis, so the job is over and the
+      // whole hold is released (it never started: released, not refunded), by the path that ends a row
+      // with no memory to ask for, with the code a refused launch specification already carries. Not
+      // retried every tick until the reservation wait runs out. The digest was written before the call.
+      console.error(`[compute-lifecycle] launch_unbuildable job=${row.id} reason=${err.reason}`);
+      return (await endUnsubmitted(env, row, "failed", "tapis_submit_failed", "invalid_spec"))
+        ? refused("failed")
+        : refused("bad_state");
+    }
     if (err instanceof TapisError && (err.kind === "rejected" || err.kind === "not_found")) {
       console.error(`[compute-lifecycle] submit_rejected job=${row.id} kind=${err.kind}`);
       return (await endUnsubmitted(env, row, "failed", "tapis_submit_failed", null))

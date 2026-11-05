@@ -24,12 +24,24 @@
  *    partition as the logical queue, and no archive system field;
  *  - the launch specification (which holds the job's token) travels in `parameterSet`, which a Tapis
  *    job record returns to whoever can read the record: the client never hands that field back, and no
- *    credential or token is in any error message or log line.
+ *    credential or token is in any error message or log line;
+ *  - the value of `NEMAR_LAUNCH_SPEC` is base64url text and nothing else (A1c, #2043): the client refuses
+ *    a raw JSON value, any character outside `A-Za-z0-9-_` and a value over the encoded bound BEFORE a
+ *    request is built, so a scheduler that quotes conditionally and has a shell source its launch file
+ *    is never handed a value that file cannot carry. The encoded value holds the token, so it is held
+ *    to every "never echoed" rule the plain token is.
  */
 
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { TAPIS_JOB_STATUSES } from "../../shared/compute-state";
 import { LAUNCHER_ENV, PARTITION_NAMES } from "../../shared/contract/compute";
+import {
+  LAUNCH_SPEC_ENV_MAX_CHARS,
+  LAUNCH_SPEC_MAX_BYTES,
+  type LaunchSpecEnvValue,
+  SHELL_INERT_ENV_ALPHABET,
+  encodeLaunchSpecEnv,
+} from "../../shared/contract/compute-launch";
 import {
   __resetTapisTokenCacheForTests,
   getTapisToken,
@@ -38,6 +50,7 @@ import {
 } from "../src/services/tapis/auth";
 import {
   type SubmitJobInput,
+  SubmitRequestRefused,
   TAPIS_MAX_DOWNLOAD_BYTES,
   TAPIS_MAX_JSON_BYTES,
   TAPIS_TIMEOUT_MS,
@@ -60,6 +73,8 @@ import * as clientModule from "../src/services/tapis/client";
 import { TAPIS_BASE, tapisConfig } from "../src/services/tapis/config";
 import { TAPIS_ERROR_KINDS, TapisError } from "../src/services/tapis/errors";
 import { SubmitJobRequestSchema } from "../src/services/tapis/schemas";
+import { launchSecretForms } from "./helpers/launch-secret-forms";
+import { launchFileLine } from "./helpers/scheduler-launch-file";
 import { SPEC_JOB_STATUSES, type TapisStandin, startTapisStandin } from "./helpers/tapis-standin";
 
 const OWNER = "someone-owner";
@@ -67,7 +82,27 @@ const OTHER_OWNER = "another-owner";
 const JOB_ID = "job_0123456789abcdef01234567";
 /** Stands for the job's token inside the launch specification. It must never be echoed. */
 const TOKEN_MARK = "JOBTOKEN-MARK-5512";
-const LAUNCH_SPEC = `{"schema":"nemar.launch-spec.v1","job_id":"${JOB_ID}","job_token":"${TOKEN_MARK}"}`;
+/**
+ * A stand-in for a launch specification's text: NOT a valid specification (the client checks only the
+ * shape of the value it is given, never the document), but printable ASCII with the token mark in it
+ * and no space, the case a conditional quoter would leave bare.
+ */
+const LAUNCH_SPEC_TEXT = `{"schema":"nemar.launch-spec.v1","job_id":"${JOB_ID}","job_token":"${TOKEN_MARK}"}`;
+/**
+ * The value of `NEMAR_LAUNCH_SPEC`: that text in base64url. It holds the token, which is no longer a
+ * plain substring of it, so a test that looks for a leak looks for the value too (`SPEC_SECRETS`).
+ */
+const LAUNCH_SPEC = encodeLaunchSpecEnv(LAUNCH_SPEC_TEXT);
+/**
+ * What must never be echoed: the token in every form it takes (plain, inside the whole encoded value, and
+ * as the three alignments of its base64url text), so that a leak of part of the value is seen too.
+ */
+const SPEC_SECRETS = launchSecretForms(TOKEN_MARK, LAUNCH_SPEC);
+/**
+ * A value the client must refuse. The type is branded and only `encodeLaunchSpecEnv` returns the brand,
+ * so a value that is meant to be invalid is cast to it, here, in the one place that says so.
+ */
+const notAValue = (value: string) => value as LaunchSpecEnvValue;
 
 let standin: TapisStandin;
 let previousOverride: string | undefined;
@@ -149,7 +184,7 @@ const SUBMIT: SubmitJobInput = {
   memoryMb: 16384,
   gpus: 0,
   minutes: 120,
-  launchSpec: LAUNCH_SPEC,
+  launchSpecEnv: LAUNCH_SPEC,
 };
 
 async function failure(run: () => Promise<unknown>): Promise<TapisError> {
@@ -891,9 +926,8 @@ describe("submitJob", () => {
       { gpus: -1 },
       { minutes: 0 },
       { memoryMb: 0 },
-      { launchSpec: "" },
-      { launchSpec: "café" },
-      { launchSpec: "x".repeat(64 * 1024 + 1) },
+      // The launch value's own refusals (empty, non-ASCII, over the bound, raw JSON, and more) are
+      // one table, `REFUSED_VALUES`, further down: not repeated here.
     ];
     for (const over of bad) {
       await expect(submitJob(ctx(env), { ...SUBMIT, ...over })).rejects.toThrow(RangeError);
@@ -909,18 +943,22 @@ describe("submitJob", () => {
     const job = await submitJob(ctx(env), SUBMIT);
     // The stand-in's record has it, as Tapis's does (the job record returns parameterSet).
     const record = standin.jobs.get(job.uuid)?.record;
-    expect(JSON.stringify(record)).toContain(TOKEN_MARK);
-    // The client's answer does not.
+    // What the stand-in holds is the encoded value: the plain token is not a substring of it.
+    expect(JSON.stringify(record)).toContain(LAUNCH_SPEC);
+    expect(JSON.stringify(record)).not.toContain(TOKEN_MARK);
+    // The client's answer holds neither the value nor the token.
     expect(job.uuid).toEqual(expect.any(String));
     expect(job.tags).toEqual([`nemar_job:${JOB_ID}`]);
-    expect(JSON.stringify(job)).not.toContain(TOKEN_MARK);
     expect(job).not.toHaveProperty("parameterSet");
     expect(job).not.toHaveProperty("subscriptions");
     const read = await getJob(ctx(env), job.uuid);
-    expect(JSON.stringify(read)).not.toContain(TOKEN_MARK);
     expect(read).not.toHaveProperty("parameterSet");
     const found = await searchJobsByTag(ctx(env), nemarJobTag(JOB_ID));
-    expect(JSON.stringify(found)).not.toContain(TOKEN_MARK);
+    for (const secret of SPEC_SECRETS) {
+      expect(JSON.stringify(job)).not.toContain(secret);
+      expect(JSON.stringify(read)).not.toContain(secret);
+      expect(JSON.stringify(found)).not.toContain(secret);
+    }
   });
 
   test("keeps what Tapis said that this client did not ask about (open responses)", async () => {
@@ -1363,7 +1401,7 @@ describe("secrets", () => {
   const SECRETS = () => [
     standin.password,
     standin.serviceToken,
-    TOKEN_MARK,
+    ...SPEC_SECRETS,
     "TOKEN-IN-THE-ADDRESS",
   ];
 
@@ -1551,10 +1589,166 @@ describe("the launch specification's other copies (what Tapis archives, and what
     ).toBe(false);
   });
 
+  /**
+   * Each is a value the client must not send: one the scheduler's launch file could not carry, or one
+   * made only of the alphabet that is still not what `encodeLaunchSpecEnv` writes (the schema's rule is
+   * the strict decoder's, not a check of the characters alone).
+   */
+  const REFUSED_VALUES: Array<[string, string]> = [
+    ["the raw JSON text, the value before A1c", LAUNCH_SPEC_TEXT],
+    ["raw JSON with no space in it, which a conditional quoter leaves bare", '{"a":"b"}'],
+    ["a base64 value with its padding", `${LAUNCH_SPEC}==`],
+    ["the two standard base64 characters", "ab+/cd"],
+    ["a space", "ab cd"],
+    ["a trailing newline", `${LAUNCH_SPEC}\n`],
+    ["a newline inside", "ab\ncd"],
+    ["a double quote", 'ab"cd'],
+    ["a single quote", "ab'cd"],
+    ["a dollar sign", "ab$cd"],
+    ["a semicolon", "ab;cd"],
+    ["an ampersand", "ab&cd"],
+    ["a pipe", "ab|cd"],
+    ["angle brackets", "ab<cd>ef"],
+    ["a backtick", "ab`cd"],
+    ["a backslash", "ab\\cd"],
+    ["a parenthesis", "ab(cd)"],
+    ["non-ASCII", "caf\u00e9"],
+    ["the empty value", ""],
+    ["one over the encoded bound", "x".repeat(LAUNCH_SPEC_ENV_MAX_CHARS + 1)],
+    ["the alphabet only, but not canonical (spare bits set)", "QR"],
+    ["the alphabet only, but a length of 1 modulo 4", "QUJDR"],
+    ["the alphabet only, but it decodes to a control byte", "AA"],
+    ["the alphabet only, but it decodes to DEL", "fw"],
+    ["the alphabet only, but it decodes to bytes from 0x80 up", "w6k"],
+    ["the alphabet only, and long, but not text", "x".repeat(100)],
+  ];
+
+  /**
+   * A real encoded value that uses all 64 characters of the alphabet: 64 groups of two spaces and a
+   * printable byte whose low six bits run through 0 to 63, which is the group's last character.
+   */
+  const EVERY_CHARACTER_VALUE = encodeLaunchSpecEnv(
+    Array.from({ length: 64 }, (_, v) => `  ${String.fromCharCode(v < 32 ? 0x40 + v : v)}`).join(
+      "",
+    ),
+  );
+  test("a value that is not shell-inert base64url is refused before anything is sent (A1c)", async () => {
+    const env = passwordEnv();
+    for (const [label, value] of REFUSED_VALUES) {
+      await expect(
+        submitJob(ctx(env), { ...SUBMIT, launchSpecEnv: notAValue(value) }),
+        label,
+      ).rejects.toThrow(RangeError);
+    }
+    expect(standin.log).toHaveLength(0);
+  });
+
+  test("the refusal names the field and never the value, which holds the token", async () => {
+    const env = passwordEnv();
+    for (const bad of [LAUNCH_SPEC_TEXT, `${LAUNCH_SPEC}==`]) {
+      let message = "";
+      try {
+        await submitJob(ctx(env), { ...SUBMIT, launchSpecEnv: notAValue(bad) });
+      } catch (error) {
+        message = (error as Error).message;
+      }
+      expect(message).toContain("parameterSet.envVariables");
+      for (const secret of [...SPEC_SECRETS, "nemar.launch-spec"]) {
+        expect(message).not.toContain(secret);
+      }
+    }
+  });
+
+  test("a refusal because of the job's own data is the typed SubmitRequestRefused, with a reason word; the owner's is not", async () => {
+    const env = passwordEnv();
+    const rows: Array<[string, Partial<SubmitJobInput>, "launch_spec_env" | "job_field"]> = [
+      [
+        "the launch value is raw JSON",
+        { launchSpecEnv: notAValue(LAUNCH_SPEC_TEXT) },
+        "launch_spec_env",
+      ],
+      ["the launch value is not canonical", { launchSpecEnv: notAValue("QR") }, "launch_spec_env"],
+      ["the launch value is empty", { launchSpecEnv: notAValue("") }, "launch_spec_env"],
+      ["a count is not a positive number", { coresPerNode: 0 }, "job_field"],
+      ["the job id is not one", { jobId: "job_nothex" }, "job_field"],
+      ["the partition is not one", { partition: "not-a-partition" as never }, "job_field"],
+      ["the GPUs are negative", { gpus: -1 }, "job_field"],
+    ];
+    for (const [label, over, reason] of rows) {
+      let error: unknown;
+      try {
+        await submitJob(ctx(env), { ...SUBMIT, ...over });
+      } catch (caught) {
+        error = caught;
+      }
+      expect(error, label).toBeInstanceOf(SubmitRequestRefused);
+      // Still a RangeError, as a refused request always was.
+      expect(error, label).toBeInstanceOf(RangeError);
+      expect((error as SubmitRequestRefused).reason, label).toBe(reason);
+      expect((error as Error).name, label).toBe("SubmitRequestRefused");
+      // It names the fields and no value: the launch value holds the job's token.
+      for (const secret of [...SPEC_SECRETS, "nemar.launch-spec"]) {
+        expect((error as Error).message, label).not.toContain(secret);
+      }
+    }
+    // The owner is NEMAR's configuration, not the job's data: it is a plain RangeError, so a caller that
+    // ends a job on the typed error leaves a job waiting for a configuration fix.
+    for (const run of [
+      () => clientModule.buildSubmitRequest("a b", SUBMIT),
+      () => clientModule.buildSubmitRequest("", SUBMIT),
+    ]) {
+      expect(run).toThrow(RangeError);
+      expect(run).not.toThrow(SubmitRequestRefused);
+    }
+    await expect(submitJob(ctx(env, { owner: "a b" }), SUBMIT)).rejects.toThrow(RangeError);
+    await expect(submitJob(ctx(env, { owner: "a b" }), SUBMIT)).rejects.not.toBeInstanceOf(
+      SubmitRequestRefused,
+    );
+    // Nothing was sent for any of them.
+    expect(standin.log).toHaveLength(0);
+  });
+
+  test("a value of exactly the encoded bound is sent, and is the one the stand-in holds", async () => {
+    const env = passwordEnv();
+    // The encoding of the largest text there is: 64 KiB of printable ASCII.
+    const longest = encodeLaunchSpecEnv("a".repeat(LAUNCH_SPEC_MAX_BYTES));
+    const job = await submitJob(ctx(env), { ...SUBMIT, launchSpecEnv: longest });
+    const sent = JSON.parse(jobCalls("POST /v3/jobs/submit")[0]?.body ?? "");
+    expect(sent.parameterSet.envVariables).toEqual([{ key: LAUNCHER_ENV.SPEC, value: longest }]);
+    expect(longest.length).toBe(87_382);
+    expect(job.uuid).toEqual(expect.any(String));
+  });
+
+  test("the request schema allows one variable, whose value is shell-inert and within the encoded bound", async () => {
+    const { buildSubmitRequest } = clientModule;
+    const built = buildSubmitRequest(OWNER, SUBMIT);
+    expect(SubmitJobRequestSchema.safeParse(built).success).toBe(true);
+    const withValue = (value: unknown) => ({
+      ...built,
+      parameterSet: {
+        ...built.parameterSet,
+        envVariables: [{ key: LAUNCHER_ENV.SPEC, value }],
+      },
+    });
+    expect(SubmitJobRequestSchema.safeParse(withValue(LAUNCH_SPEC)).success).toBe(true);
+    // The whole alphabet is accepted, in a value that really is one: all 64 characters, `-` and `_` too.
+    expect(new Set(EVERY_CHARACTER_VALUE)).toEqual(new Set(SHELL_INERT_ENV_ALPHABET));
+    expect(SubmitJobRequestSchema.safeParse(withValue(EVERY_CHARACTER_VALUE)).success).toBe(true);
+    for (const [label, value] of REFUSED_VALUES) {
+      expect(SubmitJobRequestSchema.safeParse(withValue(value)).success, label).toBe(false);
+    }
+    for (const notText of [undefined, null, 7, ["a"], {}]) {
+      expect(SubmitJobRequestSchema.safeParse(withValue(notText)).success, String(notText)).toBe(
+        false,
+      );
+    }
+  });
+
   test("the files that hold the launch specification are never downloaded or listed", async () => {
     const env = passwordEnv();
     const job = await submitJob(ctx(env), SUBMIT);
-    standin.setOutput(job.uuid, "tapisjob.env", `export ${LAUNCHER_ENV.SPEC}='${LAUNCH_SPEC}'`);
+    // The file as the scheduler writes it: the value bare, which is what a shell-inert value allows.
+    standin.setOutput(job.uuid, "tapisjob.env", launchFileLine(LAUNCH_SPEC));
     standin.setOutput(job.uuid, "tapisjob.out", "log line");
     standin.setOutput(job.uuid, "work/outputs/mytapisjob.env.csv", "a");
     standin.advance(job.uuid, "FINISHED");
@@ -1610,7 +1804,7 @@ describe.each(STRATEGIES)(
           expect(j).not.toHaveProperty("parameterSet");
           expect(j).not.toHaveProperty("subscriptions");
         }
-        expect(JSON.stringify(answer)).not.toContain(TOKEN_MARK);
+        for (const secret of SPEC_SECRETS) expect(JSON.stringify(answer)).not.toContain(secret);
         expect(JSON.stringify(answer)).not.toContain(ADDRESS_MARK);
       }
     });
@@ -1626,7 +1820,7 @@ describe.each(STRATEGIES)(
       expect(read).not.toHaveProperty("subscriptions");
       expect(JSON.stringify(read)).not.toContain(ADDRESS_MARK);
       const again = await submitJob(ctx(env), { ...SUBMIT, jobId: "job_bbbbbbbbbbbbbbbbbbbbbbbb" });
-      expect(JSON.stringify(again)).not.toContain(TOKEN_MARK);
+      for (const secret of SPEC_SECRETS) expect(JSON.stringify(again)).not.toContain(secret);
     });
   },
 );

@@ -29,11 +29,13 @@ import {
   type LifecycleFixture,
   MINUTE,
   jobTokenSeenByTapis,
+  launchSpecEnvSeenByTapis,
   makeJob,
   reread,
   setTapisTimes,
   startLifecycleFixture,
 } from "../backend/test/helpers/compute-lifecycle-fixture";
+import { launchSecretForms } from "../backend/test/helpers/launch-secret-forms";
 import { ComputeJobAdminResponseSchema } from "../shared/contract/compute-admin";
 
 const CLI_ENTRY = join(import.meta.dir, "..", "src", "index.ts");
@@ -237,6 +239,8 @@ describe("what is printed", () => {
     const first = await runCli("admin", ["advance", made.job.id]);
     const uuid = (await reread(made.env, made.job.id)).tapis_uuid as string;
     const token = jobTokenSeenByTapis(fx, uuid);
+    // The value Tapis holds carries the token, and the plain token is not a substring of it.
+    const launchValue = launchSpecEnvSeenByTapis(fx, uuid);
     fx.tapis.advance(uuid, "RUNNING");
     const second = await runCli("admin", ["advance", made.job.id, "--json"]);
     const user = fx.harness.db
@@ -245,7 +249,7 @@ describe("what is printed", () => {
     for (const out of [first, second]) {
       const all = out.stdout + out.stderr;
       for (const word of [
-        token,
+        ...launchSecretForms(token, launchValue),
         fx.tapis.url,
         "NEMAR_LAUNCH_SPEC",
         "analyse",
