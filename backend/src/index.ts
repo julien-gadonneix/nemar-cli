@@ -10,7 +10,6 @@
 
 import { Hono } from "hono";
 import { cors } from "hono/cors";
-import { logger } from "hono/logger";
 import { secureHeaders } from "hono/secure-headers";
 
 // Single source of truth for the version. The worker reads the repo-root
@@ -20,6 +19,7 @@ import { secureHeaders } from "hono/secure-headers";
 // the two manifests fails the bump rather than silently shipping.
 import pkg from "../../package.json" with { type: "json" };
 import { notFoundResponse } from "./lib/not-found";
+import { accessLogger } from "./middleware/access-log";
 import { optionalAuthMiddleware } from "./middleware/auth";
 import { maintenanceMode } from "./middleware/maintenance";
 import { rateLimiter } from "./middleware/rateLimit";
@@ -31,6 +31,7 @@ import { authKeysRoutes } from "./routes/auth-keys";
 import { authOrcidRoutes } from "./routes/auth-orcid";
 import { authPrivateRoutes } from "./routes/auth-private";
 import { authWebRoutes } from "./routes/auth-web";
+import { computeRoutes } from "./routes/compute";
 import { catalogIndexResponse, dataRoutes } from "./routes/data";
 import { datasetRoutes } from "./routes/datasets";
 import { mcpRoutes } from "./routes/mcp";
@@ -48,6 +49,12 @@ import { AUTO_IMPORT_CRON, autoImportTick } from "./services/auto-import";
 import { runAvailabilityReportSweepCron } from "./services/availability-report";
 import type { BroadcastOutboxMessage } from "./services/broadcast";
 import { fetchAndSyncCitationCounts } from "./services/citation-counts-sync";
+import {
+  cancellationsLogLine,
+  computeAdvanceLogLine,
+  runComputeAdvanceCron,
+  sweepComputeCancellations,
+} from "./services/compute-advance";
 import { isNemarWebOrigin, isOscOrigin } from "./services/cors-origins";
 import { sweepLogLines } from "./services/cron-sweep-log";
 import { fetchAndSyncDataPapers } from "./services/data-papers-sync";
@@ -128,7 +135,7 @@ import type { Bindings, Variables } from "./types/bindings";
 const api = new Hono<{ Bindings: Bindings; Variables: Variables }>();
 
 // Global middleware
-api.use("*", logger());
+api.use("*", accessLogger());
 api.use("*", secureHeaders());
 api.use(
   "*",
@@ -249,6 +256,10 @@ api.route("/users", userRoutes);
 api.route("/admin", adminRoutes);
 api.route("/datasets", datasetRoutes);
 api.route("/sandbox", sandboxRoutes);
+// The compute gateway: the launcher's job callbacks (a per-job token, no session) and, per route, the
+// person's own cancel and links (epic #2005 phase A5, #2010). Its routes are pinned by
+// test/compute-route-inventory.test.ts.
+api.route("/compute", computeRoutes);
 api.route("/webhooks", webhooks);
 // Public JSON Schema documents (issue #1059). Static, D1-free, cached: the
 // bytes are the repo's own shared/*.schema.json, the same files the Zarr
@@ -1145,6 +1156,45 @@ export default {
               console.error(
                 "[repull-advance] tick failed:",
                 err instanceof Error ? (err.stack ?? err.message) : err,
+              ),
+            ),
+        );
+        // #2010 (epic #2005 phase A5, ADR 0118): the compute gateway's backstop for the Tapis
+        // webhook hints. It reads each live job back from Tapis a few at a time, in rotation, submits
+        // a `created` job, marks one Tapis has not answered for in a day `unreported`, repairs a
+        // terminal job whose settlement or copy of its files is owed, and clears the webhook nonce a
+        // day after a job ends. PRODUCTION-ONLY, and deliberately NOT in DEV_CRON_ALLOWLIST: it acts
+        // on a Tapis tenant and moves the allocation ledger, and the dev database shares real users.
+        // It also refuses outside exact production on its own, and it reads no switch, so a live job
+        // is never stranded by turning compute off. One log line, only when it changed or failed.
+        ctx.waitUntil(
+          runComputeAdvanceCron(env)
+            .then((r) => {
+              const log = r ? computeAdvanceLogLine(r) : null;
+              if (log?.level === "error") console.error(log.line);
+              else if (log) console.log(log.line);
+            })
+            .catch((err) =>
+              console.error(
+                "[compute-advance] tick failed:",
+                err instanceof Error ? err.name : typeof err,
+              ),
+            ),
+        );
+        // The retry of every Tapis cancellation a person or an administrator asked for (the intent is
+        // recorded in the database in one batch and the network call is made here, never inside it).
+        // Production-only for the same reasons, NOT in DEV_CRON_ALLOWLIST, and self-fenced.
+        ctx.waitUntil(
+          sweepComputeCancellations(env)
+            .then((r) => {
+              const log = r ? cancellationsLogLine(r) : null;
+              if (log?.level === "error") console.error(log.line);
+              else if (log) console.log(log.line);
+            })
+            .catch((err) =>
+              console.error(
+                "[compute-cancel] sweep failed:",
+                err instanceof Error ? err.name : typeof err,
               ),
             ),
         );

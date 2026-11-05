@@ -53,6 +53,14 @@ export const LIVE_COMPUTE_STATES = [
   "unreported",
 ] as const satisfies readonly ComputeState[];
 
+/**
+ * The live states whose Tapis job exists and whose status Tapis reports: the ones a long silence turns
+ * into `unreported`. `created` and `uploading` have no Tapis job, and `unreported` already is the state.
+ */
+export const TAPIS_REPORTING_STATES = LIVE_COMPUTE_STATES.filter(
+  (s) => s !== "created" && s !== "uploading" && s !== "unreported",
+) as readonly ComputeState[];
+
 export function isComputeState(value: unknown): value is ComputeState {
   return typeof value === "string" && (COMPUTE_STATES as readonly string[]).includes(value);
 }
@@ -209,11 +217,13 @@ export function launcherExitNumber(code: LauncherFailureCode): number {
 }
 
 /**
- * Failures NEMAR caused, which are refunded automatically (design section 5). Three of them are
- * also launcher codes (a fetch and an upload, by default NEMAR's); the launcher's other four
- * (`entry_not_found`, `runtime_error`, `out_of_memory`, `time_limit`) are by default the
- * submitter's and are charged. A launcher code's `detail` can overrule the default either way: see
- * {@link LAUNCHER_DETAILS} and {@link isPlatformFailure}.
+ * Failures NEMAR caused. This is an ATTRIBUTION, never a billing rule: no failure is refunded
+ * automatically, and consumed service units stay consumed whoever caused the failure (ADR 0118,
+ * amendment of 2026-11-04, #2010); a platform failure is flagged so that an administrator can
+ * compensate it by a manual grant. Three of them are also launcher codes (a fetch and an upload,
+ * by default NEMAR's); the launcher's other four (`entry_not_found`, `runtime_error`,
+ * `out_of_memory`, `time_limit`) are by default the submitter's. A launcher code's `detail` can
+ * overrule the default either way: see {@link LAUNCHER_DETAILS} and {@link isPlatformFailure}.
  */
 export const PLATFORM_FAILURE_CODES = [
   "code_fetch_failed",
@@ -233,7 +243,7 @@ export type PlatformFailureCode = (typeof PLATFORM_FAILURE_CODES)[number];
 
 /**
  * Why NEMAR refused to take a job's results, recorded as the detail of `result_upload_failed`.
- * The submitter caused each, so such a job is charged and never refunded. Each is also a refusal
+ * The submitter caused each, so such a job is not attributed to the platform. Each is also a refusal
  * code, since the outputs route answers with it.
  */
 export const RESULT_REFUSAL_DETAILS = [
@@ -243,6 +253,43 @@ export const RESULT_REFUSAL_DETAILS = [
 ] as const;
 
 export type ResultRefusalDetail = (typeof RESULT_REFUSAL_DETAILS)[number];
+
+/** `word` as a {@link ResultRefusalDetail}, or null when it is not one (or there is none). */
+export function resultRefusalOf(word: string | null | undefined): ResultRefusalDetail | null {
+  return typeof word === "string" && (RESULT_REFUSAL_DETAILS as readonly string[]).includes(word)
+    ? (word as ResultRefusalDetail)
+    : null;
+}
+
+/**
+ * Why verification of a `FINISHED` job's results ended it `failed`: the sixteen fixed words the
+ * Worker writes as the `failure_detail` of `result_upload_failed`, `result_verification_failed` and
+ * `records_unavailable` (phase A5, #2010). Declared here, beside {@link RESULT_REFUSAL_DETAILS}, so a
+ * reader of a job's detail has one place to find every word the Worker itself chooses.
+ */
+export const VERIFY_REASONS = [
+  "not_completed",
+  "declared_missing",
+  "result_missing",
+  "provenance_missing",
+  "manifest_missing",
+  "job_id_mismatch",
+  "launch_digest_mismatch",
+  "bundle_digest_mismatch",
+  "image_digest_mismatch",
+  "result_reports_failure",
+  "exit_mismatch",
+  "output_missing",
+  "output_size_mismatch",
+  "output_checksum_mismatch",
+  "manifest_mismatch",
+  "launcher_file_missing",
+] as const;
+
+export type VerifyReason = (typeof VERIFY_REASONS)[number];
+
+/** The detail of a job whose recorded specification (or whose records bucket) could not be read to verify it. */
+export const RECORDS_UNREADABLE = "records_unreadable";
 
 /**
  * Every fixed-word `detail` the launcher may write into `launcher/result.json` with each of its
@@ -318,9 +365,9 @@ export type LauncherDetail = (typeof LAUNCHER_DETAILS)[LauncherFailureCode][numb
 
 /**
  * The launcher details that are a NEMAR, node, runtime or contract fault, so that the job is
- * refunded, even under `runtime_error`. The rule: a detail is the platform's if and only if a
+ * attributed to the platform, even under `runtime_error`. The rule: a detail is the platform's if and only if a
  * submitter cannot cause it with a valid specification and bundle. Every other word of
- * {@link LAUNCHER_DETAILS} is the submitter's and is charged, even under `code_fetch_failed` and
+ * {@link LAUNCHER_DETAILS} is the submitter's, even under `code_fetch_failed` and
  * `dataset_fetch_failed`: an archive that is unsafe or too large, a selection over the job's own
  * limits or an include pattern that is not a glob, an entry that failed or was terminated, outputs
  * that cannot be read, and the results NEMAR refused for their size or count.
@@ -357,6 +404,20 @@ export const PLATFORM_LAUNCHER_DETAILS = [
 
 export type ComputeFailureCode = LauncherFailureCode | PlatformFailureCode;
 
+/**
+ * A detail the launcher itself wrote in `result.json` that {@link LAUNCHER_DETAILS} does not declare for
+ * its code (a transport word such as `http_500`): kept as the launcher said it, and deliberately so (the
+ * code alone then decides who caused the failure). A brand, so that the one place that accepts such a
+ * word is visible in the types and no other string passes for a detail.
+ */
+export type LauncherWord = string & { readonly __launcherWord: true };
+
+/** Every fixed word the WORKER chooses as a failure detail: the launcher's declared words, the verification reasons, and one more. */
+export type WorkerFailureDetail = LauncherDetail | VerifyReason | typeof RECORDS_UNREADABLE;
+
+/** What `failure_detail` may hold when the Worker writes it: a closed word, or the launcher's own undeclared one. */
+export type ComputeFailureDetail = WorkerFailureDetail | LauncherWord;
+
 /** Every code a failed job may carry, each once: the launcher's seven, then the platform's rest. */
 export const COMPUTE_FAILURE_CODES: readonly ComputeFailureCode[] = [
   ...LAUNCHER_FAILURE_CODES,
@@ -366,13 +427,14 @@ export const COMPUTE_FAILURE_CODES: readonly ComputeFailureCode[] = [
 ];
 
 /**
- * Whether NEMAR caused a failure, so that its charge is refunded. For a launcher code with a detail
- * that {@link LAUNCHER_DETAILS} declares for that code, the detail decides: a platform detail
+ * Whether NEMAR caused a failure. An information flag for reports and manual compensation: it never
+ * drives a ledger write (no automatic refund exists). For a launcher code with a detail that
+ * {@link LAUNCHER_DETAILS} declares for that code, the detail decides: a platform detail
  * ({@link PLATFORM_LAUNCHER_DETAILS}) is a platform failure even under `runtime_error`, and any
  * other declared detail is the submitter's even under `code_fetch_failed` or
- * `dataset_fetch_failed`, and is charged. With no detail, or one not declared for its code, the
- * code alone decides, as it always did: true for every platform code, false for the rest. A code
- * that is not a failure code is not a platform failure.
+ * `dataset_fetch_failed`. With no detail, or one not declared for its code, the code alone decides,
+ * as it always did: true for every platform code, false for the rest. A code that is not a failure
+ * code is not a platform failure.
  */
 export function isPlatformFailure(code: string, detail?: string | null): boolean {
   if (detail != null && Object.hasOwn(LAUNCHER_DETAILS, code)) {
@@ -387,7 +449,7 @@ export function isPlatformFailure(code: string, detail?: string | null): boolean
 /**
  * Tapis's own termination conditions, from the `Job.condition` enum of its published Jobs
  * specification, sorted into NEMAR's failure codes. Anything not listed is `tapis_error`, which is
- * the safe default: a platform failure, refunded, and looked at.
+ * the safe default: a platform failure, flagged, and looked at.
  */
 const TAPIS_CONDITION_CODE: ReadonlyMap<string, ComputeFailureCode> = new Map<
   string,
@@ -452,6 +514,9 @@ export const COMPUTE_REFUSAL_CODES = [
   // Phase A2 (#2007): a hold the caller's own guard refused (a person's live-job limit, say). The
   // ledger cannot name the guard, so it answers with this word and the caller says which one.
   "guard_refused",
+  // Phase A5 (#2010): the launcher called `complete` and an object it declared is missing or short.
+  // Retryable: the launcher uploads what is missing and asks again.
+  "results_incomplete",
 ] as const;
 
 export type ComputeRefusalCode = (typeof COMPUTE_REFUSAL_CODES)[number];
@@ -491,7 +556,29 @@ export const COMPUTE_REFUSAL_STATUS = {
   job_not_found: 404,
   bad_state: 409,
   guard_refused: 409,
+  results_incomplete: 409,
 } as const satisfies Record<ComputeRefusalCode, number>;
+
+/**
+ * The one sentence each refusal of the job routes (`/compute/jobs/...`, the launcher's three callbacks
+ * and the person's cancel and links) answers with, declared once beside the status so no route words its
+ * own. A sentence says what was refused and never why a token, a job or a bundle was not accepted. A code
+ * a route answers with that has no sentence here is a type error at the route. The pool and job-creation
+ * routes carry their own words.
+ */
+export const COMPUTE_ROUTE_SENTENCES = {
+  job_not_found: "No such job.",
+  bad_state: "The job is not in a state that accepts this.",
+  results_expired: "The results of this job have expired.",
+  compute_disabled: "Compute storage is not configured.",
+  invalid_spec: "The request is not valid.",
+  too_many_outputs: "The job declared more output files than the owner's limit allows.",
+  results_too_large: "The job's results are over the size limit.",
+  results_quota_exceeded: "There is no room left in the results budget for this job.",
+  results_incomplete: "An object the job declared is missing or short; upload it and ask again.",
+} as const satisfies Partial<Record<ComputeRefusalCode, string>>;
+
+export type ComputeRouteSentenceCode = keyof typeof COMPUTE_ROUTE_SENTENCES;
 
 // --- The rest of the vocabulary ----------------------------------------------------------------
 

@@ -227,7 +227,8 @@ export type ComputePolicyResponse = z.infer<typeof ComputePolicyResponseSchema>;
  *  - `tapis.token` and `tapis.health` are `ok`, `unconfigured`, `skipped` (no username to probe
  *    with under the service strategy) or the kind of the error the call failed with
  *    (`unauthorized`, `not_found`, `rejected`, `unavailable`, `invalid_response`): a string here,
- *    not an enum, so a word the Worker adds does not break a released CLI.
+ *    not an enum, so a word the Worker adds does not break a released CLI;
+ *  - `runtime_image` is whether the runtime image variable is set and valid, and its digest.
  */
 export const ComputeStatusResponseSchema = z
   .object({
@@ -255,7 +256,70 @@ export const ComputeStatusResponseSchema = z
       })
       .passthrough(),
     access: z.object({ key_configured: z.boolean() }).passthrough(),
+    /**
+     * `COMPUTE_RUNTIME_IMAGE`, NEMAR's own image for a `python` job: whether it is `set`, whether it is a
+     * `valid` digest-pinned reference, and its `digest` (null unless valid; the reference is never sent).
+     * Optional so a CLI that reads a Worker from before the field existed still parses its answer.
+     */
+    runtime_image: z
+      .object({ set: z.boolean(), valid: z.boolean(), digest: z.string().nullable() })
+      .passthrough()
+      .optional(),
   })
   .passthrough();
 
 export type ComputeStatusResponse = z.infer<typeof ComputeStatusResponseSchema>;
+
+const nullableString = z.string().nullable();
+
+/**
+ * A job as an administrator's command prints it (epic #2005 phase A5, #2010): fixed words, numbers and
+ * times. No identity, no specification, no token, no address and no log. `platform_failure` is an
+ * INFORMATION flag, true when NEMAR, the node, the runtime or the contract caused the failure, so that an
+ * administrator can compensate it by a manual grant: nothing is refunded automatically. Every word is a
+ * string here, not an enum, so a word the Worker adds does not break a released CLI.
+ */
+export const ComputeJobViewSchema = z
+  .object({
+    id: z.string(),
+    account_id: z.number().int().nullable(),
+    source: z.string(),
+    kind: z.string(),
+    state: z.string(),
+    tapis_status: nullableString,
+    failure_code: nullableString,
+    failure_detail: nullableString,
+    platform_failure: z.boolean(),
+    cancel_requested: z.boolean(),
+    cancel_reason: nullableString,
+    partition: z.string(),
+    pool: z.string(),
+    held_milli: milli,
+    charged_milli: milli,
+    settled: z.boolean(),
+    flags: z.array(z.string()),
+    created_at: z.string(),
+    submitted_at: nullableString,
+    started_at: nullableString,
+    ended_at: nullableString,
+    tapis_synced_at: nullableString,
+    outputs_completed: z.boolean(),
+    results_verified: z.boolean(),
+    results_bytes: z.number().int().nullable(),
+    records_copied: z.boolean(),
+  })
+  .passthrough();
+
+export type ComputeJobView = z.infer<typeof ComputeJobViewSchema>;
+
+/** `POST /admin/compute/jobs/:id/cancel` and `.../advance`: what happened, and the job as it is now. */
+export const ComputeJobAdminResponseSchema = z
+  .object({
+    ok: z.boolean(),
+    outcome: z.string(),
+    submit: z.string().optional(),
+    job: ComputeJobViewSchema.nullable(),
+  })
+  .passthrough();
+
+export type ComputeJobAdminResponse = z.infer<typeof ComputeJobAdminResponseSchema>;

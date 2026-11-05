@@ -8,6 +8,7 @@
  *   nemar admin compute pool grant <amount> ...           SU into one pool (admin; a platform budget: owner)
  *   nemar admin compute pool adjust <amount> ...          a correction of its grant (a charge: owner)
  *   nemar admin compute status [--json]                   the switches, Tapis and storage, as the Worker reads them (admin)
+ *   nemar admin compute jobs cancel|advance <id> [--json] cancel a job, or take it one step on (admin; src/commands/admin-compute-jobs.ts)
  *
  * Amounts are service units (SU) as plain decimals with at most three places (`12.5`), and are sent
  * as whole thousandths. Every write sends one fresh `Idempotency-Key`, so within one invocation the
@@ -56,6 +57,7 @@ import {
   putComputePolicy,
 } from "../lib/api/compute.js";
 import { plain } from "../lib/terminal-text.js";
+import { jobsCommand } from "./admin-compute-jobs.js";
 
 const ACCOUNT_RE = /^[1-9][0-9]{0,14}$/;
 const POLICY_FILE_MAX_BYTES = 256 * 1024;
@@ -549,6 +551,8 @@ a tenant name or a username.
              unavailable, invalid_response)
   storage    whether each compute bucket binding and the signing secrets are set
   ACCESS key whether the ACCESS gateway-attributes key is set
+  runtime image whether the runtime image variable is set, whether it is a digest-pinned reference,
+             and its digest (never the reference); a python job is not submitted until it is valid
 
 Admin or owner. --json prints the Worker's answer as it is.
 
@@ -578,6 +582,17 @@ function printStatus(res: ComputeStatusResponse): void {
   say(`  results binding: ${yesNo(res.storage.results_binding)}`);
   say(`  signing secrets: ${yesNo(res.storage.signing_configured)}`);
   say(`ACCESS key: ${yesNo(res.access.key_configured)}`);
+  say("Runtime image");
+  const image = res.runtime_image;
+  if (image === undefined) {
+    say("  set: unknown (this Worker does not report it)");
+  } else if (!image.set) {
+    say("  set: no (a python job stays created until it is)");
+  } else if (!image.valid) {
+    say("  set: yes, but not a digest-pinned reference (a python job stays created)");
+  } else {
+    say(`  set: yes, digest ${plain(image.digest ?? "unknown")}`);
+  }
 }
 
 const statusCommand = new Command("status")
@@ -605,3 +620,4 @@ export const computeCommand = new Command("compute").description(
 computeCommand.addCommand(policyCommand);
 computeCommand.addCommand(poolCommand);
 computeCommand.addCommand(statusCommand);
+computeCommand.addCommand(jobsCommand);
