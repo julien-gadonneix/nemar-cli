@@ -219,6 +219,19 @@ const MODULE_EXPORTS: Record<string, string[]> = {
     "zarrFidelitySweep",
   ],
   notices: ["NOTICE_LEVELS", "createNotice", "deleteNotice", "getNotices", "listAdminNotices"],
+  oidc: [
+    "createOidcClient",
+    "disableOidcClient",
+    "endOidcAccount",
+    "getOidcClient",
+    "listOidcClients",
+    "listOidcKeys",
+    "listOidcLogoutDeliveries",
+    "oidcErrorCode",
+    "revokeOidcKey",
+    "rotateOidcClientSecret",
+    "rotateOidcKeys",
+  ],
   repull: [
     "acceptRepullMergeTrailers",
     "acknowledgeRepullScreen",
@@ -411,6 +424,17 @@ const POST_SPLIT_ADDITIONS = [
   "listComputeAccessReports", // epic #2005 phase A7: reporting, holds, ACCESS reports and the observer (admin/compute)
   "requeueComputeAccessReport", // epic #2005 phase A7: reporting, holds, ACCESS reports and the observer (admin/compute)
   "mintComputeObserverRun", // epic #2005 phase A7: reporting, holds, ACCESS reports and the observer (admin/compute)
+  "createOidcClient", // epic #2014 phase #2016: POST /admin/oidc/clients (shared/contract/oidc-admin.ts)
+  "listOidcClients", // epic #2014 phase #2016: GET /admin/oidc/clients
+  "getOidcClient", // epic #2014 phase #2016: GET /admin/oidc/clients/:client_id
+  "rotateOidcClientSecret", // epic #2014 phase #2016: POST /admin/oidc/clients/:client_id/rotate-secret
+  "disableOidcClient", // epic #2014 phase #2016: POST /admin/oidc/clients/:client_id/disable
+  "listOidcKeys", // epic #2014 phase #2016: GET /admin/oidc/keys
+  "rotateOidcKeys", // epic #2014 phase #2016: POST /admin/oidc/keys/rotate
+  "revokeOidcKey", // epic #2014 phase #2016: POST /admin/oidc/keys/:kid/revoke
+  "oidcErrorCode", // epic #2014 phase #2016: the closed word of an /admin/oidc refusal (rawBody.code)
+  "endOidcAccount", // epic #2014 phase #2019: POST /admin/oidc/accounts/:id/end (shared/contract/oidc-admin.ts)
+  "listOidcLogoutDeliveries", // epic #2014 phase #2019: GET /admin/oidc/logout-deliveries
   "lockS3Objects", // #1912 phase 6f: POST /admin/datasets/:id/s3-lock with an explicit list
   "OBJECTS_PER_EXPLICIT_LOCK", // #1912 phase 6f: the explicit lock's batch size
 ];

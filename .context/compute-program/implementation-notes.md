@@ -95,13 +95,15 @@ Those live in the gated docs page `admin/design/compute-gateway` and in secrets.
 - **Location.** `users.city`, `users.country` (free text), `users.affiliation` (migration `0052`).
 - **Kinds.** `users.account_kind` is `person|service|test` (ADR 0048); only an owner sets it; service accounts get owner-minted keys (`nemar admin keys create`).
 - **Cascades.** Credential-ending paths: `finalizeRevocation`, the owner soft delete (`tombstoneUserCascade` in `backend/src/db/user-tombstone.ts`), role demotion, key revocation (`revokeDocsCredentials` in `services/docs-auth.ts`).
+  An account's OpenID Connect grants are a third set: `oidcEndStatements` (`services/oidc-cascade.ts`) is added to the batch of every path that ends a credential for good, `OIDC_END_CALLERS` lists them and a test holds the list to the code; role demotion, key revocation and sign-out leave them alone on purpose (ADR 0119 rule 12). A compute suspension will end only grants that carry a `compute.` scope: `oidcEndStatements(userId, "compute_suspended", { scopePrefix: OIDC_COMPUTE_SCOPE_PREFIX })`, and the caller is the compute access phase's to add.
   `DOCS_GRANTS_PURGE_SQL` and `PRIVATE_GRANTS_PURGE_SQL` name their callers in docblocks, and those counts are load-bearing: add a line for every new path.
   A network call (a Tapis cancel) never runs inside the batch; record intent in the batch and let a retried sweep do the call, as the GitHub collaborator sweep does.
   `computeReleaseStatements` (`services/compute-release.ts`, phase A8, section 11) is the compute counterpart of `mailReleaseStatements`: TWO callers, `finalizeRevocation` and `tombstoneUserCascade`, and neither a role demotion nor a key revocation.
   `services/test-account-sweep.ts` has its own clear list.
 - **Keys have no scopes.** A NEMAR API key carries its user's full authority. OIDC access tokens must be refused by every existing route.
-- **CORS and cookie trust.** `isNemarWebOrigin` (`services/cors-origins.ts`) and `isAllowedOrigin` (`services/web-session.ts`, several call sites) both trust `*.nemar.org`.
-  The session cookie is `nemar_session`, `Domain=app.nemar.org`, `SameSite=Lax` (`routes/auth-orcid.ts`), without a `__Host-` prefix.
+- **CORS and cookie trust.** `isNemarWebOrigin` (`services/cors-origins.ts`) and `isAllowedOrigin` (`services/web-session.ts`, several call sites) trust `*.nemar.org` except a partner host (`shared/partner-hosts.ts`, ADR 0119): `compute.nemar.org` reaches NEMAR only through OIDC and bearer tokens.
+  The session cookie is written by `sessionCookieHeaders` and read by `readSessionCookie` (both in `services/web-session.ts`, the only readers and writers): `nemar_session` (with `Domain=app.nemar.org` where `WEB_SESSION_COOKIE_DOMAIN` is set, which staging leaves empty) until `HOST_PREFIXED_SESSION_COOKIE` is `"1"`, then `__Host-nemar_session` (host-only, no `Domain`) with the legacy name still read.
+  Every account has an opaque `users.oidc_subject` (`nmu_` plus 32 lowercase hex, migration 0120) that is on no existing response; `USER_COLUMN_ROLES` classifies it `secret` and `GET /admin/users/by-oidc-subject/:sub` (owner only) is the only way to resolve one.
 - **Handoff precedents.** Docs (ADR 0056) and private site (ADR 0079): a 60-second hashed code, single use by a DELETE gated on the row, a `state` cookie against login CSRF (ADR 0079 decision 3), RPC exchange for same-account Workers (ADR 0078).
 
 ## 4. Tests

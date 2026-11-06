@@ -28,3 +28,11 @@ A role demotion and an API key revocation deliberately leave `private` sessions 
 ## Compute follows the same rule
 
 `services/compute-release.ts` does the same for an account's compute: two callers, `finalizeRevocation` and `tombstoneUserCascade`, a role demotion and a key revocation deliberately outside it, and `backend/test/compute-end-callers.test.ts` fails when a new path that revokes all of a user's keys and sessions through the statement shapes it recognises (named in its header) runs neither those statements nor a named exception.
+
+## OpenID Connect grants hang off the account
+
+A third set hangs off the account itself: the grants, tokens and codes of NEMAR's OpenID Connect provider (ADR 0119).
+`oidcEndStatements` in `services/oidc-cascade.ts` is added to the batch of every path that ends a credential for good, `OIDC_END_CALLERS` lists them, and a test holds that list to the code.
+`finalizeRevocation` and `tombstoneUserCascade` run both sets, compute and OpenID Connect, in their one batch.
+A role demotion, an API key revocation and the app session's sign-out leave those grants alone on purpose (rule 12).
+A back-channel logout is queued in that batch and sent afterwards, never inside it: a request to a partner's server must not be able to fail a revocation, and no dev or staging Worker may reach a real partner host (rule 15).

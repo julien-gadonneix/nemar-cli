@@ -28,6 +28,7 @@ import { authRoutes } from "./routes/auth";
 import { authDeviceRoutes } from "./routes/auth-device";
 import { authDocsRoutes } from "./routes/auth-docs";
 import { authKeysRoutes } from "./routes/auth-keys";
+import { authOidcRoutes } from "./routes/auth-oidc";
 import { authOrcidRoutes } from "./routes/auth-orcid";
 import { authPrivateRoutes } from "./routes/auth-private";
 import { authWebRoutes } from "./routes/auth-web";
@@ -37,6 +38,8 @@ import { datasetRoutes } from "./routes/datasets";
 import { mcpRoutes } from "./routes/mcp";
 import { neurobagelRoutes } from "./routes/neurobagel";
 import { newsRoutes } from "./routes/news";
+import { oauthRoutes } from "./routes/oauth";
+import { oidcDiscoveryRoutes } from "./routes/oidc-discovery";
 import { openApiRoutes } from "./routes/openapi";
 import { sandboxRoutes } from "./routes/sandbox";
 import { schemaRoutes } from "./routes/schemas";
@@ -110,6 +113,7 @@ import {
   verificationLogLine,
 } from "./services/neurobagel-verify";
 import { getActiveNotices } from "./services/notices";
+import { logoutTickLogLine, runOidcLogoutRetryTick } from "./services/oidc-logout";
 import { sweepStalePrReviews } from "./services/pr-review";
 import { sweepPublicationReviews } from "./services/publication-review";
 import { sweepBlockedBidsValidationRequests } from "./services/publication-sweep";
@@ -235,6 +239,18 @@ api.route("/news", newsRoutes);
 // re-checked against D1. Off (404) until NEUROBAGEL_READ_TOKEN and the bucket exist.
 api.route("/neurobagel", neurobagelRoutes);
 
+// OpenID Connect discovery and the signing keys' public set (epic #2014 phase #2016, ADR 0119): the
+// issuer is this host, permanently, so both documents are exempt from the maintenance mode and the
+// rate limiter, and both are 404 unless OIDC_SECRET is set and the request names the issuer's own
+// host with no /nemar prefix (routes/oidc-discovery.ts, `oidcSurface`).
+api.route("/", oidcDiscoveryRoutes);
+// The token, userinfo, revocation and introspection endpoints (epic #2014 phase #2018, ADR 0119):
+// /oauth/token, /oauth/userinfo, /oauth/revoke and /oauth/introspect. 404 until OIDC_SECRET is set
+// AND HOST_PREFIXED_SESSION_COOKIE is "1", on the issuer's host with no /nemar prefix, as the
+// authorization routes are (routes/oauth.ts). Unlike discovery and the key set they are rate limited
+// (the `oauth-ip` bucket) and under the maintenance mode.
+api.route("/oauth", oauthRoutes);
+
 // Mount route handlers
 api.route("/auth", authRoutes);
 // Web-dashboard auth (#569). Mounted at the same /auth prefix as the
@@ -259,6 +275,11 @@ api.route("/auth", authDocsRoutes);
 // /auth/private/grant. The exchange, the per-request check and sign-out are
 // service-binding methods (ADR 0078), not routes.
 api.route("/auth", authPrivateRoutes);
+// The OpenID Connect authorization endpoint's check and consent (epic #2014 phase #2017, ADR 0119).
+// Same /auth prefix; paths /auth/oidc/authorize and /auth/oidc/consent, called by the website's
+// /oauth/authorize page server-side with its caller marker. 404 until OIDC_SECRET is set AND
+// HOST_PREFIXED_SESSION_COOKIE is "1" (routes/auth-oidc.ts).
+api.route("/auth", authOidcRoutes);
 api.route("/users", userRoutes);
 api.route("/admin", adminRoutes);
 api.route("/datasets", datasetRoutes);
@@ -404,6 +425,21 @@ app.route("/", api);
 // apps: `POST /auth/docs/grant` answers 404 for a signed-in non-admin, and a
 // 404 that does not look like the others is a 404 that identifies itself.
 app.notFound(notFoundResponse);
+
+/**
+ * The Worker's whole route table, for the test that calls every route with an OpenID Connect access
+ * token and requires the answer an unknown API key gets (epic #2014 phase #2018; ADR 0119 rule 4):
+ * built from this table, a route added later is in that test without anyone listing it. A function
+ * and not the app itself, because a named export that is an object with a `fetch` method could be
+ * read by the runtime as an entrypoint.
+ */
+export function __workerRouteTable(): ReadonlyArray<{
+  method: string;
+  path: string;
+  handler: unknown;
+}> {
+  return app.routes;
+}
 
 /**
  * Scheduled cleanup handler (Cloudflare Workers cron trigger).
@@ -1248,6 +1284,30 @@ export default {
               console.error(
                 "[compute-tenant] sweep failed:",
                 err instanceof Error ? err.name : typeof err,
+              ),
+            ),
+        );
+        // Epic #2014 phase #2019 (ADR 0119 rule 15): the back-channel logout retry tick. A client that
+        // registered a logout address is told when an account's grants end, from `waitUntil` right after
+        // the commit; a delivery that did not go through (a 5xx, a timeout, no connection) is retried
+        // here on its own schedule (1 minute, 5 minutes, 30 minutes, 2 hours and 12 hours, so a short
+        // wait is taken up at the next half hour), at most 20 a tick, each in its own try and catch.
+        // PRODUCTION-ONLY, and deliberately NOT in DEV_CRON_ALLOWLIST: it makes OUTBOUND requests to
+        // addresses partners registered, and the dev Worker shares real accounts. It also refuses outside
+        // exact production on its own, and a delivery is sent only to an https host the registry
+        // validated. It mails nobody, calls no GitHub and touches no DOI or bucket. One log line, only
+        // when it found a delivery or failed, with counts and a fixed word and nothing else.
+        ctx.waitUntil(
+          runOidcLogoutRetryTick(env)
+            .then((r) => {
+              const log = r ? logoutTickLogLine(r) : null;
+              if (log?.level === "error") console.error(log.line);
+              else if (log) console.log(log.line);
+            })
+            .catch((err) =>
+              console.error(
+                "[oidc-logout] tick failed:",
+                err instanceof Error ? (err.stack ?? err.message) : err,
               ),
             ),
         );

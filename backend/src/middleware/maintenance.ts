@@ -8,6 +8,8 @@
 
 import type { Context, Next } from "hono";
 import { COMPUTE_JOB_ID_RE } from "../../../shared/contract/compute";
+
+import { OIDC_PUBLIC_DOCUMENT_PATHS } from "../../../shared/oidc.js";
 import type { Bindings, Variables } from "../types/bindings";
 import {
   type ActiveMaintenanceMode,
@@ -21,6 +23,11 @@ type MaintenanceContext = Context<{ Bindings: Bindings; Variables: Variables }>;
 const READ_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
 const ALWAYS_ALLOWED_PATHS = new Set(["/", "/health", "/notices"]);
+
+// Discovery and the signing keys' public set live on the API host permanently (ADR 0119): a client that
+// cannot fetch them during maintenance cannot validate a token it was already given. A READ of them:
+// any other method of those paths is under the mode like everything else.
+const PUBLIC_DOCUMENT_READS = new Set(["GET", "HEAD"]);
 
 // Mutating routes that remain open in read-only so admins can still moderate
 // (admin), GitHub webhooks can still deliver (webhooks), and a locked-out
@@ -44,6 +51,15 @@ function isLauncherCallback(method: string, path: string): boolean {
   const match = LAUNCHER_CALLBACK_RE.exec(path);
   return match !== null && COMPUTE_JOB_ID_RE.test(match[1] ?? "");
 }
+
+// The two OpenID Connect endpoints that are POSTs and only read (ADR 0119 rule 14): userinfo, which
+// a client may call by POST, and introspection, which a partner's resource server calls on every
+// request it checks. Their handlers write nothing, so read-only serves them: exact paths, POST only
+// (a GET already passes as a read; PUT, DELETE and PATCH are refused like any other write), and only
+// in read-only (`full` refuses them like everything else). The token endpoint and revocation write
+// and stay refused, so in read-only no partner can refresh and partner sessions lapse within the
+// access token's 15 minutes.
+const READ_ONLY_OIDC_READS = new Set(["/oauth/userinfo", "/oauth/introspect"]);
 
 let warnedUnknownMode = false;
 
@@ -98,7 +114,10 @@ export async function maintenanceMode(c: MaintenanceContext, next: Next) {
 
   const path = c.req.path;
 
-  if (ALWAYS_ALLOWED_PATHS.has(path)) {
+  if (
+    ALWAYS_ALLOWED_PATHS.has(path) ||
+    (OIDC_PUBLIC_DOCUMENT_PATHS.includes(path) && PUBLIC_DOCUMENT_READS.has(c.req.method))
+  ) {
     await next();
     return;
   }
@@ -112,7 +131,10 @@ export async function maintenanceMode(c: MaintenanceContext, next: Next) {
     return;
   }
 
-  if (READ_ONLY_EXACT_MUTATIONS.has(path)) {
+  if (
+    READ_ONLY_EXACT_MUTATIONS.has(path) ||
+    (c.req.method === "POST" && READ_ONLY_OIDC_READS.has(path))
+  ) {
     await next();
     return;
   }
