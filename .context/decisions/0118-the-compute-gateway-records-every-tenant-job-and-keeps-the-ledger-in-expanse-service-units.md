@@ -454,7 +454,7 @@ Not verified: the figures in the registry (cores, memory, minutes), the 10-job t
    The sweep reads the compute switch (`computeEnabled`), which the source scan of phase A5 had allowed in one place; the scan names the sweep now.
 4. **The observer is an unsigned sender with a token for one run.**
    An administrator mints it (`POST /admin/compute/observer-runs`, audited): `<run id>.<HMAC>` under the callback secret with the domain tag `compute-observer` over the run id and the run's own nonce, valid for an hour, never stored.
-   `POST /compute/observer` takes the header `X-Compute-Observer-Token`, checks it BEFORE it reads a byte, answers ONE refusal (`403 observer_refused`) for a wrong, expired, reused, unknown or missing token, reads at most 1 MiB, validates every row to the shape of its column, and only then spends the run with one conditional UPDATE, so two posts racing make one ingest and a body that fails validation does not spend the run.
+   `POST /compute/observer` takes the token as `Authorization: Bearer <token>` (the amendment of 2026-11-06 replaced the header `X-Compute-Observer-Token` and the body described here), checks it BEFORE it reads a byte, answers ONE refusal (`403 observer_refused`) for a wrong, expired, reused, unknown or missing token, reads at most 1 MiB, validates the document and every row it maps to to the shape of its column, and only then spends the run with one conditional UPDATE, so two posts racing make one ingest and a body that fails validation does not spend the run.
    The two bounds, 1 MiB and 5,000 rows, are both kept; the longest row is 231 bytes, so 1 MiB admits about 4,500 of them.
 5. **Final settlement against Expanse's figure** (`settleObservedRows`, run by the ingest and by the daily sweep): a stored row is matched to the job with its Slurm id; when that job has ended with a provisional `charge` and no final one, `settleFinal` brings the charge to the row's own `charged_milli` or, when it sent none, to the rate table's figure for the allocation it reports (per node: the row's CPUs, memory and GPUs are totals).
    A difference within `settle.toleranceMilli` or `settle.tolerancePercent` of the provisional charge is routine; beyond it `flag_mismatch` is set and the job is STILL settled to Expanse's figure.
@@ -501,3 +501,46 @@ The owner approved these five decisions of phase A7 (#2012) as they stand in the
 3. **D3.** Migration 0130 keeps the account link (`compute_gateway_users.account_id`) and the `gw_` pseudonym for ever, and the migration 0115 triggers refuse change and delete. A deleted account's pools and ledger actors are anonymized (0130); the pseudonym mapping is not.
 4. **D4.** `TENANT_GIVE_UP_DAYS` stays at 7 days; a followed unreserved row closes with nothing charged.
 5. **D5.** The 30-minute tick stays equal to the default `reservationWaitMinutes` (30), so a `created` job gets one retry before `submit_timeout`.
+
+## Amendment 2026-11-06: the Worker adopts the observer's document
+
+The integration review of the compute epic found that the Worker and the real observer (`observer/observe.py` in `nemarOrg/nemar-process`) did not speak the same wire: the Worker read the header `X-Compute-Observer-Token` and a strict `{snapshots, sacct}` body of its own design, and the observer posts a `nemar.observation.v1` document with `Authorization: Bearer <token>`.
+The owner decided that the Worker adopts the observer's document and the observer is not changed.
+This amendment supersedes the wire described in item 4 of the amendment of 2026-11-05, and nothing else of it: the token, the one refusal, the 1 MiB and 5,000-row bounds, the single conditional UPDATE that spends the run, the settlement and the tolerance are as they were.
+
+1. **The document is written once, as a JSON Schema, and shared byte for byte.**
+   `shared/contract/compute-observation.schema.json` (draft 2020-12, every object the observer writes closed) is the same file as `observer/schema/observation-v1.schema.json` in nemar-process, the way the launch specification is shared.
+   A zod schema in `shared/contract/compute-observation.ts` mirrors it, and `test/compute-observation-contract.unit.test.ts` holds the two to each other on a corpus of valid and invalid documents.
+   The schema was derived from what the observer emits, and the two documents the observer itself wrote (`test/fixtures/compute-observation/`) are fixtures on both sides.
+   Drift is checked on both sides: nemar-process compares its copies with nemar-cli's at a pinned commit (CI sets `NEMAR_REQUIRE_OBSERVATION_DRIFT=1` and checks the commit out), and nemar-cli compares with a nemar-process checkout when `NEMAR_PROCESS_OBSERVATION_DIR` names one (`NEMAR_REQUIRE_PROCESS_OBSERVATION_DRIFT=1` turns a missing checkout into a failure).
+   `test.yml` checks out nemar-process's integration branch (public, sparse, no token) and sets both, so CI compares against that branch's HEAD, not a pinned commit; it does not check that nemar-process's own CI is green or that its pin is current (its advisory job says so).
+   A change to the document is made in nemar-cli and copied, never edited in one copy.
+2. **The token is `Authorization: Bearer <token>` only.**
+   The header `X-Compute-Observer-Token` is not read; a post that carries it alone is the one refusal, like a wrong token.
+   Nothing else about the token changed: the one-hour per-run `compute-observer` HMAC, constant-time comparison, identical refusals for a wrong, expired, reused, unknown and missing token, and never logged.
+3. **The document is validated, then mapped to the stored rows by a table.**
+   `services/compute-observation.ts` holds the table (partition queue figures to `compute_queue_snapshots`; each accounting job to a `compute_sacct_rows` row; `charged_milli` always NULL, so the rate table prices the allocation as it does for any row without a figure of its own).
+   The CPU, memory, node and GPU figures are read from `alloc_tres` by one function, `parseAllocTres`, which fails closed: a value it cannot read refuses the post (400 `invalid_post`, the path and the fixed word `malformed_tres`, never the value), the run is not spent and nothing is stored.
+   Memory is converted to megabytes with Slurm's powers of 1024 and rounded up; a number with no unit is refused unless it is 0.
+   A row with elapsed time and no `cpu` item is refused (`missing_cpu`): an allocation that ran and is not on record would be priced at nothing, which is a guess.
+   A row with elapsed time and no `node` item is refused the same way (`missing_node`): the settlement reads no node as one node, which is a guess too.
+   A refusal lists at most five paths, and a key the sender chose (a partition, a state, a reason, an allocation item) is printed as `<key>`.
+4. **What is skipped is counted, not refused.**
+   A partition whose queue was not read (`jobs` is null) is not stored as zero; a row whose job id is not one Slurm job (a pending array `123_[1-5]`), whose partition, state or elapsed time the observer could not read, or whose value is past a column's bound is not a job NEMAR could have submitted as one Slurm job.
+   Both are skipped and counted in `skipped` in the answer, so one array on the community account does not stop the rest of the day from settling.
+   A `truncated` export says so in the answer (`truncated: true`).
+   The rows it lost are NOT on a later export: `sacct -S day -E day+1` selects a job by the day it ran, so a job that began and ended inside the cut day is on no other export and stays at its provisional charge until an administrator moves it.
+5. **A mode is never a dry run.** The observer defines `quick` and `daily`; both are live.
+   A `quick` document has no `accounting` and no `sources.sacct` (the schema requires both for `daily`), so it stores the queue and settles whatever earlier rows can now be settled.
+   Any other `mode`, and a `schema` word that is not exactly `nemar.observation.v1`, is refused like any malformed body.
+6. **A decision for the owner to confirm: one unreadable row refuses the whole day.**
+   An `alloc_tres` value that `parseAllocTres` cannot read, a row with elapsed time and no `cpu` item, and a row with elapsed time and no `node` item each refuse the entire post (400 `invalid_post`, the run not spent, nothing stored), not just the row.
+   That is deliberate and fail closed: a charge that is guessed is a charge to a person's pool, and a post that settles part of a day hides that the rest was refused.
+   The cost is that the same document is refused on every retry until the observer or the cluster's text changes, so one row can hold back a whole day of settlement.
+   The alternative is to skip and count such a row as the unreadable-partition rows are; it is not taken here, and the owner is asked to confirm the choice.
+7. **Open item for the observer-dispatch phase: the row cap and the byte cap differ.**
+   The observer cuts its export by bytes only (1 MiB, from the end), and the Worker refuses more than 5,000 rows (partitions and accounting jobs together).
+   A busy day of short rows can pass 5,000 jobs inside 1 MiB, and the document is then refused `too_big` on every retry, so that day never settles.
+   The observer is not changed here; the dispatch phase has to choose between a row cap in the observer, a larger Worker bound, or accepting the refusal and re-reading the day in parts.
+8. **Not verified.** The observer's formats were written from the Slurm manual and the public user guide, not captured from a cluster (nemar-process `docs/unverified.md`), so this schema describes what the observer emits and not what a cluster has been seen to print.
+   A quick post is made every 15 minutes and a token is good for one post, so a token per quick run must be minted; that is the operator's procedure and is not decided here.
