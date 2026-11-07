@@ -51,7 +51,6 @@
 import {
   type ComputeFailureCode,
   type ComputeFailureDetail,
-  type ComputeJobFlag,
   type ComputeState,
   LIVE_COMPUTE_STATES,
   RECORDS_UNREADABLE,
@@ -63,6 +62,7 @@ import {
   resultRefusalOf,
   stateFromTapisStatus,
 } from "../../../shared/compute-state.js";
+import type { ComputeJobView } from "../../../shared/contract/compute-admin.js";
 import {
   type LaunchSpecEnvValue,
   encodeLaunchSpec,
@@ -81,6 +81,7 @@ import {
 } from "../../../shared/contract/compute.js";
 import type { Bindings } from "../types/bindings.js";
 import { ACCESS_REPORT_PENDING_SQL } from "./access-attributes.js";
+import { flagsOf } from "./compute-job-flags.js";
 import {
   type ComputeJobRow,
   LIVE_STATES_SQL,
@@ -340,6 +341,66 @@ export const UNCOPIED_TERMINAL_SQL = `SELECT id FROM compute_jobs
     AND ended_at >= datetime('now', '-${RECORDS_COPY_RETRY_DAYS} days')
   ORDER BY examined_at ASC, ended_at ASC LIMIT ?1`;
 
+/** A recorded cancel that is still not carried out this long after it was asked for is reported as stuck. */
+export const CANCEL_PENDING_FAILED_MINUTES = 60;
+
+/**
+ * Live rows whose recorded cancel is still not carried out {@link CANCEL_PENDING_FAILED_MINUTES} minutes
+ * after it was asked for, on the cancel sweep's own list (so a partner's reservation, which is not the
+ * sweep's, and a job of the tenant sweep are not counted). A cancel the sweep retries every 30 minutes has
+ * had at least one retry fail by then. The count the status view and the sweep's line carry as
+ * `cancel_pending_failed`; never a row id.
+ */
+export const CANCEL_PENDING_FAILED_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
+  WHERE state IN (${LIVE_STATES_SQL}) AND cancel_requested_at IS NOT NULL
+    AND flag_unreserved = 0
+    AND NOT (source = 'partner' AND tapis_uuid IS NULL)
+    AND cancel_requested_at < datetime('now', '-${CANCEL_PENDING_FAILED_MINUTES} minutes')`;
+
+/** {@link CANCEL_PENDING_FAILED_SQL} as a number. */
+export async function countCancelPendingFailed(db: D1Database): Promise<number> {
+  return (await db.prepare(CANCEL_PENDING_FAILED_SQL).first<{ n: number }>())?.n ?? 0;
+}
+
+/**
+ * Terminal rows whose copy of the launcher files and logs was never made and no longer will be: past the
+ * {@link RECORDS_COPY_RETRY_DAYS} days {@link UNCOPIED_TERMINAL_SQL} retries it (its exact complement), and
+ * not yet reduced by retention. Without this the failure was a `console.error` and the row dropped out of
+ * the list for good. Each such row is flagged `mismatch` (where it is not flagged already: a row born
+ * flagged, like a lost record, is abandoned all the same), so `jobs list` and the status view show it to an
+ * administrator.
+ */
+export const MARK_COPY_ABANDONED_SQL = `UPDATE compute_jobs SET flag_mismatch = 1
+  WHERE state IN (${TERMINAL_STATES_SQL}) AND result_records_at IS NULL
+    AND settled_provisional_at IS NOT NULL AND flag_unreserved = 0 AND records_deleted_at IS NULL
+    AND flag_mismatch = 0
+    AND ended_at < datetime('now', '-${RECORDS_COPY_RETRY_DAYS} days')`;
+
+/** How many days after the retry window closes the tick still reports an abandoned copy (the running total never expires). */
+export const COPY_ABANDONED_REPORT_DAYS = 30;
+
+/**
+ * The abandoned rows the TICK reports, whatever their flag: those whose window closed in the last
+ * {@link COPY_ABANDONED_REPORT_DAYS} days. A standing count that never ended would be an error line every
+ * half hour for the years until retention; a month is long enough to be noticed.
+ */
+export const COPY_ABANDONED_RECENT_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
+  WHERE state IN (${TERMINAL_STATES_SQL}) AND result_records_at IS NULL
+    AND settled_provisional_at IS NOT NULL AND flag_unreserved = 0 AND records_deleted_at IS NULL
+    AND ended_at < datetime('now', '-${RECORDS_COPY_RETRY_DAYS} days')
+    AND ended_at >= datetime('now', '-${RECORDS_COPY_RETRY_DAYS + COPY_ABANDONED_REPORT_DAYS} days')`;
+
+/** The rows {@link MARK_COPY_ABANDONED_SQL} describes, flagged or not and however old: the number an administrator is shown. */
+export const COPY_ABANDONED_COUNT_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
+  WHERE state IN (${TERMINAL_STATES_SQL}) AND result_records_at IS NULL
+    AND settled_provisional_at IS NOT NULL AND flag_unreserved = 0 AND records_deleted_at IS NULL
+    AND ended_at < datetime('now', '-${RECORDS_COPY_RETRY_DAYS} days')`;
+
+/** {@link COPY_ABANDONED_COUNT_SQL} as a number. */
+export async function countCopyAbandoned(db: D1Database): Promise<number> {
+  return (await db.prepare(COPY_ABANDONED_COUNT_SQL).first<{ n: number }>())?.n ?? 0;
+}
+
 /** The cancel sweep took this row: `?1` the job. Its own rotation (`cancel_attempted_at`), apart from the tick's. */
 export const STAMP_CANCEL_ATTEMPT_SQL =
   "UPDATE compute_jobs SET cancel_attempted_at = datetime('now') WHERE id = ?1";
@@ -348,6 +409,23 @@ export const STAMP_CANCEL_ATTEMPT_SQL =
 export const UNREADABLE_GIVE_UP_DAYS = 7;
 
 // --- Small helpers -------------------------------------------------------------------------------
+
+/** The unrecognized status Tapis answered, kept on a live row: `?1` the job, `?2` the word. Touches nothing else, so the row's last good read keeps ageing. */
+export const STORE_UNKNOWN_STATUS_SQL = `UPDATE compute_jobs SET tapis_status = ?2
+  WHERE id = ?1 AND state IN (${LIVE_STATES_SQL})`;
+
+/** The word to store for a status NEMAR does not know: the word when it fits the column and names no known status, else a fixed one. */
+export function unknownStatusWord(status: unknown): string {
+  const word = typeof status === "string" ? status : "";
+  return /^[A-Z_]{1,32}$/.test(word) && stateFromTapisStatus(word) === null ? word : "UNRECOGNIZED";
+}
+
+/** A status word from Tapis as a log line may carry it: letters and underscores only, at most 32. */
+export function logSafeStatus(status: unknown): string {
+  return String(status ?? "")
+    .replace(/[^A-Za-z_]/g, "")
+    .slice(0, 32);
+}
 
 /** The error's class name: all a log line ever says of a failure. */
 export const errorClassName = (err: unknown): string =>
@@ -1162,6 +1240,115 @@ async function endUnsubmitted(
   return won;
 }
 
+/**
+ * What a lost job settles at, from the ROW alone (its Tapis record cannot be read). The code's own rule
+ * applies: a job that ran is never released, because a release closes the hold and the ledger then
+ * refuses a charge, so a wrong release is permanent (see {@link provisionalCharge}).
+ *  - EVIDENCE OF START: `started_at` is set (an earlier read showed the job running). The job is charged
+ *    for the time from that start to now, capped at the job's own time limit (`minutes`), through
+ *    `provisionalCharge` with the figures the row has; the settlement caps it at the hold and puts any
+ *    excess to overrun, as for any failed job that ran.
+ *  - OTHER EVIDENCE OF USE: the launcher reached the Worker (`results_bytes`, `outputs_completed_at`), the
+ *    scheduler gave the job an id (`slurm_job_id`), or Tapis last reported it `running` or `archiving`.
+ *    The contract's minimum is charged.
+ *  - NO EVIDENCE of ever starting: the hold is released, nothing is charged. Any use after that is
+ *    flagged (`mismatch`), not reconciled: the observer corrects only a row with a `charge` entry, and the
+ *    tenant sweep skips a bound row.
+ */
+export function lostSettlement(job: ComputeJobRow, nowMs: number): Provisional {
+  const startedMs = parseMs(job.started_at);
+  if (startedMs !== null) {
+    const endedMs = Math.min(nowMs, startedMs + job.minutes * 60_000);
+    const priced = provisionalCharge(
+      job,
+      {
+        remoteStarted: new Date(startedMs).toISOString(),
+        remoteEnded: new Date(Math.max(startedMs, endedMs)).toISOString(),
+      } as TapisJob,
+      nowMs,
+    );
+    // Flagged `mismatch` whatever the pricing says: the record is gone.
+    return priced;
+  }
+  const otherEvidence =
+    job.results_bytes !== null ||
+    job.outputs_completed_at !== null ||
+    job.slurm_job_id !== null ||
+    job.state === "running" ||
+    job.state === "archiving";
+  return otherEvidence
+    ? { kind: "charge", milli: RATE_TABLE_V1.minChargeMilli, seconds: 0, fallback: true }
+    : { kind: "release" };
+}
+
+/**
+ * A live job whose Tapis record is GONE ends `failed` with `tapis_record_lost` (owner decision of
+ * 2026-11-06, refined in review). It is called only for a read that answered 404, never for any other
+ * failure (a refused credential, a response that fails its schema and a Tapis that is down each leave the
+ * job `unreported` and loud): a record that is merely unreadable may still be running.
+ *
+ *  - A job with NO evidence of ever starting is RELEASED with no charge, once (the same release statement,
+ *    key and gate as any release);
+ *  - a job that ran is CHARGED provisionally ({@link lostSettlement}), once, capped at the hold, excess to
+ *    overrun as for any failed job;
+ *  - either way the row is flagged `mismatch` and the failure is the platform's. A released job's later
+ *    use is flagged for an administrator and is not reconciled by the observer or the tenant sweep;
+ *  - the Tapis uuid is recorded as the row's ORPHAN, so a job that is in fact still running is cancelled
+ *    by the orphan retry loop as soon as Tapis answers a cancel.
+ * The row leaves the live states, which frees the account's quota slot, and a pipeline stamp that reads
+ * it fails with the same word. True when this call moved the row.
+ */
+async function endRecordLost(
+  env: Bindings,
+  job: ComputeJobRow,
+  nowMs: number = Date.now(),
+): Promise<boolean> {
+  const plan: TerminalPlan = {
+    to: "failed",
+    failureCode: "tapis_record_lost",
+    failureDetail: null,
+    cancelReason: null,
+    platformFailure: true,
+    verified: false,
+    mismatch: true,
+    tapisStatus: null,
+    remoteSubmittedAt: null,
+    startedAt: null,
+    endedAt: null,
+    slurmJobId: null,
+    settlement: lostSettlement(job, nowMs),
+    unsubmittedOnly: false,
+  };
+  const won = await commitTerminal(env, job, plan, await recordsRetentionYears(env));
+  if (!won) return false;
+  console.error("[compute-lifecycle] tapis_record_lost");
+  if (job.tapis_uuid !== null) await recordOrphan(env, job.id, job.tapis_uuid);
+  await afterTerminal(env, (await getJob(env.DB, job.id)) ?? job, plan);
+  return true;
+}
+
+/**
+ * Whether a live row may be declared lost for want of a read: its last SUCCESSFUL read of Tapis is more
+ * than {@link UNREADABLE_GIVE_UP_DAYS} days old, and Tapis has not answered it with a word NEMAR does not
+ * know since. `tapis_synced_at` is the last good read that NEMAR could use; a status NEMAR does not know
+ * never refreshes it (so the job still goes `unreported` after a day), but it is stored in `tapis_status`,
+ * and a stored word that is no known status means Tapis ANSWERED after that read. A job Tapis answered is
+ * never lost.
+ */
+function recordLostByAge(job: ComputeJobRow, nowMs: number): boolean {
+  if (job.tapis_status !== null && stateFromTapisStatus(job.tapis_status) === null) return false;
+  const lastGood = job.tapis_synced_at ?? job.submitted_at ?? job.created_at;
+  return ageMinutes(lastGood, nowMs) > UNREADABLE_GIVE_UP_DAYS * 24 * 60;
+}
+
+/** A 404 on the cancel and on the read-back may end a job only if its last good read is over a day old. */
+const LOST_ON_CANCEL_MIN_MINUTES = 24 * 60;
+
+function recordLostOnCancel(job: ComputeJobRow, nowMs: number): boolean {
+  const lastGood = job.tapis_synced_at ?? job.submitted_at ?? job.created_at;
+  return ageMinutes(lastGood, nowMs) > LOST_ON_CANCEL_MIN_MINUTES;
+}
+
 /** The webhook subscription of a bound job: a hint only, so a failure is a fixed word and nothing more. */
 async function subscribe(
   env: Bindings,
@@ -1205,9 +1392,36 @@ export async function recordOrphan(env: Bindings, jobId: string, uuid: string): 
 }
 
 /**
+ * Whether a Tapis job is confirmed gone: a read of it answers 404. Anything else (it answers, or the read
+ * itself fails) is not a confirmation.
+ */
+async function tapisRecordGone(ctx: TapisContext, uuid: string): Promise<boolean> {
+  try {
+    await getTapisJob(ctx, uuid);
+    return false;
+  } catch (err) {
+    return err instanceof TapisError && err.kind === "not_found";
+  }
+}
+
+/** Whether a read of the Tapis job shows it has ended (any terminal status). A failed read is not a confirmation. */
+async function tapisRecordEnded(ctx: TapisContext, uuid: string): Promise<boolean> {
+  try {
+    const state = stateFromTapisStatus((await getTapisJob(ctx, uuid)).status);
+    return state !== null && isTerminalComputeState(state);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Cancel a Tapis job NEMAR made that no row owns, and clear the record of it once that is known to have
- * worked: the cancel was accepted, Tapis says the job is already over (409) or says there is no such job.
- * Any other failure leaves `orphan_tapis_uuid` set, and the next tick tries again. True when cleared.
+ * worked: the cancel was accepted, Tapis says the job is already over (409), or says there is no such job
+ * (404) AND a read of the job confirms it, or refuses the cancel (a 4xx other than 404, as a finished job
+ * may be answered) AND a read shows the job has ended. Any other answer, a 400 on a live job or a 403, leaves
+ * `orphan_tapis_uuid` set and the next tick tries again: it is the tenant sweep's rule, and an orphan that
+ * is still running spends the allocation (review fixes of 2026-11-06; the first version cleared the
+ * record on any `rejected`). True when cleared.
  */
 async function cancelOrphan(
   env: Bindings,
@@ -1218,8 +1432,15 @@ async function cancelOrphan(
   try {
     await cancelJob(ctx, uuid);
   } catch (err) {
+    const over = err instanceof TapisError && err.status === 409;
+    // A 404 is settled only if a read confirms the job is gone; a refusal (a 400 for cancelling a job that
+    // already finished, say) only if a read shows the job has ended. Any other answer stays marked.
     const settled =
-      err instanceof TapisError && (err.kind === "rejected" || err.kind === "not_found");
+      over ||
+      (err instanceof TapisError &&
+        err.kind === "not_found" &&
+        (await tapisRecordGone(ctx, uuid))) ||
+      (err instanceof TapisError && err.kind === "rejected" && (await tapisRecordEnded(ctx, uuid)));
     if (!settled) {
       console.warn(`[compute-lifecycle] orphan_cancel_failed job=${jobId} kind=${tapisWord(err)}`);
       return false;
@@ -1231,18 +1452,19 @@ async function cancelOrphan(
 
 /**
  * The retry of a recorded orphan: the tick calls it for every row with `orphan_tapis_uuid` set. Never
- * throws for what Tapis does; true when the orphan is cleared.
+ * throws for what Tapis does. `ended` when the orphan is cleared, `failed` when it is not (Tapis could not
+ * be asked or did not take the cancel), `skipped` when there is no orphan to cancel.
  */
 export async function retryOrphanCancel(
   env: Bindings,
   jobId: string,
   mode: { maxAttempts: number; timeoutMs: number },
-): Promise<boolean> {
+): Promise<CancelDrive> {
   const row = await getJob(env.DB, jobId);
-  if (!row || row.orphan_tapis_uuid === null) return false;
+  if (!row || row.orphan_tapis_uuid === null) return "skipped";
   const ctx = tapisAccess(env, mode);
-  if (ctx === null) return false;
-  return cancelOrphan(env, ctx, row.id, row.orphan_tapis_uuid);
+  if (ctx === null) return "failed";
+  return (await cancelOrphan(env, ctx, row.id, row.orphan_tapis_uuid)) ? "ended" : "failed";
 }
 
 /**
@@ -1533,21 +1755,30 @@ export async function requestComputeCancel(
 }
 
 /**
+ * What {@link driveCancel} came to: `ended` (the row is over), `pending` (the cancel is under way or waits
+ * on something that is not a fault: a submitter's lease, a cancel Tapis accepted that is not yet shown),
+ * `failed` (Tapis could not be asked, or did not take the cancel and the job is not shown to be over: the
+ * intent stays recorded and the sweep counts it) and `skipped` (nothing was owed here).
+ */
+export type CancelDrive = "ended" | "pending" | "failed" | "skipped";
+
+/**
  * Carry out a recorded cancel as far as it can go now. Never throws for what Tapis does: a failure is a
- * fixed word, and the intent stays recorded.
+ * fixed word and an outcome, and the intent stays recorded.
  */
 export async function driveCancel(
   env: Bindings,
   jobId: string,
   mode: { maxAttempts: number; timeoutMs: number },
-): Promise<void> {
+): Promise<CancelDrive> {
   let job = await getJob(env.DB, jobId);
-  if (!job || isTerminalComputeState(job.state) || job.cancel_requested_at === null) return;
+  if (!job || isTerminalComputeState(job.state) || job.cancel_requested_at === null)
+    return "skipped";
   // A job that skipped the reservation is the tenant sweep's, which cancels it and follows it to its end
   // (phase A7): the lifecycle's read-back would verify results a foreign job never uploaded.
-  if (job.flag_unreserved === 1) return;
+  if (job.flag_unreserved === 1) return "skipped";
   if (job.tapis_uuid === null) {
-    if (job.state !== "created" && job.state !== "uploading") return;
+    if (job.state !== "created" && job.state !== "uploading") return "skipped";
     // A PARTNER'S RESERVATION is the partner contract's (phase D4), never ended here. NEMAR does not take
     // a submit lease or write a launch specification for a partner job (the partner launches its own
     // Tapis job under the reservation), so every test below, which proves that NEMAR's own submit never
@@ -1555,7 +1786,7 @@ export async function driveCancel(
     // release a hold for a job that may be running. The intent stays recorded and the sweep's list leaves
     // the row out (`CANCEL_ROWS_SQL`), like `CREATED_ROWS_SQL`. Once it HAS a Tapis job it is cancelled
     // there like any other: NEMAR owns every Tapis job.
-    if (job.source === "partner") return;
+    if (job.source === "partner") return "skipped";
     // A submitter holds the lease: a Tapis job may be in flight that no search can see yet (Tapis has
     // not persisted it, or the answer has not come back). Ending the row now could release the hold for a
     // job that then appears, and if the submitter's answer is also lost nothing would ever search for it
@@ -1563,7 +1794,8 @@ export async function driveCancel(
     // pending cancel into an orphan cancel, and once the lease ends the sweep's tag search is the
     // authority (round 2 of #2041).
     const claimedMs = parseMs(job.submit_claimed_at);
-    if (claimedMs !== null && Date.now() - claimedMs < SUBMIT_LEASE_MINUTES * 60_000) return;
+    if (claimedMs !== null && Date.now() - claimedMs < SUBMIT_LEASE_MINUTES * 60_000)
+      return "pending";
     // A job that never reached Tapis is ended here, and a submit in flight meets a row it cannot bind
     // and cancels the Tapis job it made. But a job whose launch specification was written has been
     // SUBMITTED at least once, and a submit whose answer was lost may have made a Tapis job: ending the
@@ -1571,7 +1803,7 @@ export async function driveCancel(
     // by tag. If it cannot be asked, the cancel stays recorded for the sweep and nothing is released.
     if (job.launch_spec_digest !== null) {
       const ctx = tapisAccess(env, mode);
-      if (ctx === null) return;
+      if (ctx === null) return "failed";
       let found: TapisJob[];
       try {
         found = await searchJobsByTag(ctx, nemarJobTag(job.id));
@@ -1579,7 +1811,7 @@ export async function driveCancel(
         console.warn(
           `[compute-lifecycle] cancel_search_failed job=${job.id} kind=${tapisWord(err)}`,
         );
-        return;
+        return "failed";
       }
       const first = found[0];
       if (first !== undefined && TAPIS_JOB_UUID_RE.test(first.uuid)) {
@@ -1593,25 +1825,29 @@ export async function driveCancel(
           }
         }
         job = await getJob(env.DB, jobId);
-        if (!job || job.tapis_uuid === null || isTerminalComputeState(job.state)) return;
+        if (!job || isTerminalComputeState(job.state)) return "ended";
+        if (job.tapis_uuid === null) return "pending";
       } else {
-        await endUnsubmitted(env, job, "cancelled", null, null);
-        return;
+        return (await endUnsubmitted(env, job, "cancelled", null, null)) ? "ended" : "pending";
       }
     } else {
-      await endUnsubmitted(env, job, "cancelled", null, null);
-      return;
+      return (await endUnsubmitted(env, job, "cancelled", null, null)) ? "ended" : "pending";
     }
   }
   const uuid = job.tapis_uuid as string;
   const ctx = tapisAccess(env, mode);
-  if (ctx === null) return;
+  if (ctx === null) return "failed";
+  // Only a 409 means Tapis says the job is already over. Any other answer to the cancel, a 400 or a 403
+  // included, did not take it; the read-back below shows whether the job ended anyway (a lost answer may
+  // have cancelled it), and if it did not, the cancel is `failed` and is asked again by the next tick.
+  let cancelFailed = false;
+  let cancelNotFound = false;
   try {
     await cancelJob(ctx, uuid);
   } catch (err) {
-    // 409: Tapis says the job is already over, which the read-back below shows. Anything else is left
-    // for the sweep (a lost answer may have cancelled it; the read-back shows that too).
-    if (!(err instanceof TapisError && err.kind === "rejected")) {
+    if (!(err instanceof TapisError && err.status === 409)) {
+      cancelFailed = true;
+      cancelNotFound = err instanceof TapisError && err.kind === "not_found";
       console.warn(`[compute-lifecycle] cancel_unclear job=${job.id} kind=${tapisWord(err)}`);
     }
   }
@@ -1621,7 +1857,21 @@ export async function driveCancel(
     await applyTapisJob(env, fresh, rec);
   } catch (err) {
     console.warn(`[compute-lifecycle] cancel_readback_failed job=${job.id} kind=${tapisWord(err)}`);
+    // The cancel answered 404 AND the read-back answered 404: Tapis has no such job. Somebody asked for the
+    // job to end, and there is nothing to cancel or to read, so it ends as lost rather than waiting a week.
+    // Only if the last good read is over a day old, so one wrong-tenant 404 cannot end a job at once.
+    if (cancelNotFound && err instanceof TapisError && err.kind === "not_found") {
+      const fresh = (await getJob(env.DB, job.id)) ?? job;
+      if (isTerminalComputeState(fresh.state)) return "ended";
+      if (recordLostOnCancel(fresh, Date.now()) && (await endRecordLost(env, fresh))) {
+        return "ended";
+      }
+    }
+    return cancelFailed ? "failed" : "pending";
   }
+  const after = await getJob(env.DB, job.id);
+  if (after === null || isTerminalComputeState(after.state)) return "ended";
+  return cancelFailed ? "failed" : "pending";
 }
 
 // --- Advance -------------------------------------------------------------------------------------
@@ -1637,6 +1887,12 @@ export type AdvanceOutcome =
 export interface AdvanceResult {
   outcome: AdvanceOutcome;
   job: ComputeJobRow | null;
+  /**
+   * Set when a terminal row was owed a settlement or a copy: `finished` when everything owed is now done,
+   * `incomplete` when an attempt was made and something is still owed. Absent when nothing was owed. The
+   * tick counts the two apart, so an attempt that did not work is not reported as a repair.
+   */
+  repair?: "finished" | "incomplete";
   /** Set when a submit was attempted: what it answered. */
   submit?: SubmitOutcome;
 }
@@ -1697,10 +1953,33 @@ export async function advanceComputeJob(
     rec = await getTapisJob(ctx, job.tapis_uuid);
   } catch (err) {
     console.warn(`[compute-lifecycle] readback_failed job=${job.id} kind=${tapisWord(err)}`);
-    await markUnreportedIfStale(env, job);
+    // A record that answers 404 for a week is lost, not merely silent. Only a 404 counts: a refused
+    // credential, a response that fails its schema, or a Tapis that is down for a week leaves the job
+    // `unreported` (the state a person is told by), loudly, and never ends it.
+    if (err instanceof TapisError && err.kind === "not_found" && recordLostByAge(job, nowMs)) {
+      await endRecordLost(env, job, nowMs);
+    } else {
+      if (!(err instanceof TapisError && err.kind === "not_found") && recordLostByAge(job, nowMs)) {
+        console.error(`[compute-lifecycle] unreadable_for_a_week kind=${tapisWord(err)}`);
+      }
+      await markUnreportedIfStale(env, job);
+    }
     return { outcome: "unreachable", job: await getJob(env.DB, job.id) };
   }
   const applied = await applyTapisJob(env, job, rec, nowMs);
+  if (applied.outcome === "unknown_status") {
+    // A status outside the thirteen words NEMAR knows is treated like a record that cannot be read: nothing
+    // is refreshed, so the row's last good read ages, and after a day it is `unreported` and a person
+    // looks. Without this the job froze live for ever with nothing said. The word is logged shortened and
+    // stripped to letters and underscores, since Tapis wrote it.
+    console.warn(`[compute-lifecycle] unknown_status status=${logSafeStatus(rec.status)}`);
+    // Remember that Tapis ANSWERED: the word is stored in `tapis_status` (it is shown to an administrator
+    // too), and a stored word that is no known status stops the lost-by-age rule for this job.
+    await env.DB.prepare(STORE_UNKNOWN_STATUS_SQL)
+      .bind(job.id, unknownStatusWord(rec.status))
+      .run();
+    await markUnreportedIfStale(env, job);
+  }
   return { outcome: applied.outcome, job: await getJob(env.DB, job.id) };
 }
 
@@ -1766,7 +2045,10 @@ async function repairTerminal(
     }
     current = (await getJob(env.DB, current.id)) ?? current;
   }
-  return { outcome: "terminal", job: current };
+  const done =
+    (!needsSettlement || current.settled_provisional_at !== null) &&
+    (!needsCopy || current.result_records_at !== null);
+  return { outcome: "terminal", job: current, repair: done ? "finished" : "incomplete" };
 }
 
 // --- What an administrator is shown ----------------------------------------------------------------
@@ -1777,12 +2059,7 @@ async function repairTerminal(
  * `platform_failure` is the information flag that says NEMAR caused the failure (so an administrator can
  * compensate it by a manual grant: nothing is refunded automatically).
  */
-export function jobView(job: ComputeJobRow) {
-  const flags: ComputeJobFlag[] = [];
-  if (job.flag_unreserved === 1) flags.push("unreserved");
-  if (job.flag_unattributed === 1) flags.push("unattributed");
-  if (job.flag_mismatch === 1) flags.push("mismatch");
-  if (job.flag_overrun === 1) flags.push("overrun");
+export function jobView(job: ComputeJobRow): ComputeJobView {
   return {
     id: job.id,
     account_id: job.account_id,
@@ -1800,7 +2077,7 @@ export function jobView(job: ComputeJobRow) {
     held_milli: job.held_milli,
     charged_milli: job.charged_milli,
     settled: job.settled_provisional_at !== null,
-    flags,
+    flags: flagsOf(job),
     created_at: job.created_at,
     submitted_at: job.submitted_at,
     started_at: job.started_at,
@@ -1812,5 +2089,3 @@ export function jobView(job: ComputeJobRow) {
     records_copied: job.result_records_at !== null,
   };
 }
-
-export type ComputeJobView = ReturnType<typeof jobView>;

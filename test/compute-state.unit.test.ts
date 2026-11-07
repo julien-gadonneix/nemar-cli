@@ -405,11 +405,13 @@ describe("refusal codes", () => {
     ["guard_refused", 409],
     // Phase A5 (#2010): the launcher called `complete` and an object it declared is missing or short.
     ["results_incomplete", 409],
+    // Review fixes of 2026-11-06: a transient fault reading the owner's policy; not `compute_disabled`.
+    ["policy_unavailable", 503],
   ];
 
   test("the list is the seven of section 6 plus the seventeen the phase names, the ledger's one and the outputs route's", () => {
     expect([...COMPUTE_REFUSAL_CODES] as string[]).toEqual(EXPECTED.map(([c]) => c));
-    expect(COMPUTE_REFUSAL_CODES).toHaveLength(26);
+    expect(COMPUTE_REFUSAL_CODES).toHaveLength(27);
     // The per-job limit refusal is `over_job_limit`; there is no second word for it.
     expect(COMPUTE_REFUSAL_CODES).not.toContain("over_ceiling");
   });
@@ -473,7 +475,7 @@ describe("the ACCESS report words (phase A8, #2013)", () => {
 });
 
 describe("failure codes", () => {
-  test("COMPUTE_FAILURE_CODES is the launcher's seven then the platform's other eight, in order", () => {
+  test("COMPUTE_FAILURE_CODES is the launcher's seven then the platform's other nine, in order", () => {
     // Phase A5 checks a failure code read from launcher/result.json against this list.
     expect([...COMPUTE_FAILURE_CODES]).toEqual([
       "code_fetch_failed",
@@ -491,6 +493,7 @@ describe("failure codes", () => {
       "tapis_error",
       "result_verification_failed",
       "records_unavailable",
+      "tapis_record_lost",
     ]);
   });
 
@@ -518,7 +521,7 @@ describe("failure codes", () => {
     expect(launcherExitNumber("result_upload_failed")).toBe(16);
   });
 
-  test("the platform codes are the eleven the phase names", () => {
+  test("the platform codes are the eleven the phase names and the one the review added", () => {
     expect([...PLATFORM_FAILURE_CODES]).toEqual([
       "code_fetch_failed",
       "dataset_fetch_failed",
@@ -531,6 +534,7 @@ describe("failure codes", () => {
       "result_verification_failed",
       "records_unavailable",
       "result_upload_failed",
+      "tapis_record_lost",
     ]);
   });
 
@@ -985,6 +989,7 @@ describe("the words the job routes and the lifecycle share", () => {
       "compute_disabled",
       "invalid_spec",
       "job_not_found",
+      "policy_unavailable",
       "results_expired",
       "results_incomplete",
       "results_quota_exceeded",

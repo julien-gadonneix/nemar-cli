@@ -107,6 +107,21 @@ export const RETRY_COOLDOWN_DAYS = 7;
 export const MAX_FAILED_ATTEMPTS = 3;
 
 /**
+ * Platform failure words that happen AFTER the run consumed service units: the job ran, then its results
+ * could not be taken or checked. Re-dispatching on the next day would spend the pool again with no
+ * cooldown, so these count toward the cooldown and the cap like a dataset's own failure (ADR 0118, review
+ * fixes of 2026-11-06). A failed job that was charged anything counts the same whatever its word, which
+ * the queue reads from the linked job row ({@link CHARGED_FAILURE_SQL}); a failure before any charge
+ * (staging, `tapis_submit_failed`) stays an immediate candidate.
+ */
+export const CONSUMED_FAILURE_WORDS: readonly string[] = [
+  "result_upload_failed",
+  "result_verification_failed",
+  // The job may have run for real; its record is gone and nothing was charged, so it cannot be told apart.
+  "tapis_record_lost",
+];
+
+/**
  * The words of a `failed` stamp that are NOT the dataset's doing, so they never count toward the cooldown
  * or the cap: the platform's own failure codes (`PLATFORM_FAILURE_CODES`: Tapis, staging, launch, archive,
  * verification, records, and the launcher's fetch and upload codes, whose detail is not kept on the
@@ -120,7 +135,7 @@ export const MAX_FAILED_ATTEMPTS = 3;
  * (`outputs_missing`, `record_unreadable`, `record_mismatch`).
  */
 export const NON_DATASET_FAILURE_WORDS: readonly string[] = [
-  ...PLATFORM_FAILURE_CODES,
+  ...PLATFORM_FAILURE_CODES.filter((w) => !CONSUMED_FAILURE_WORDS.includes(w)),
   "job_cancelled",
   "no_job",
   "job_missing",
@@ -133,6 +148,15 @@ export const NON_DATASET_FAILURE_WORDS: readonly string[] = [
 
 /** The list as SQL: fixed words of this tree, never a caller's. */
 const NON_DATASET_FAILURE_SQL = NON_DATASET_FAILURE_WORDS.map((w) => `'${w}'`).join(", ");
+
+/**
+ * A failed stamp counts (cooldown and cap) when its word is the dataset's, or when its linked job failed
+ * after being charged. `x` is the stamp alias; the job is read by the stamp's `job_id`.
+ */
+const COUNTS_AS_FAILURE_SQL = (x: string): string =>
+  `(${x}.refusal_code NOT IN (${NON_DATASET_FAILURE_SQL})
+    OR EXISTS (SELECT 1 FROM compute_jobs cj
+                WHERE cj.id = ${x}.job_id AND cj.state = 'failed' AND cj.charged_milli > 0))`;
 
 /** Stamps one sync examines at most. */
 export const SYNC_STAMPS_PER_CALL = 50;
@@ -480,7 +504,13 @@ export async function dispatchPipelineJob(
     if (looksUnique(err)) return fail("live_attempt_exists", datasetId, { version: tag });
     throw err;
   }
-  const stamp = (await getStamp(db, stampId)) as StampRow;
+  const stamp = await getStamp(db, stampId);
+  if (stamp === null) {
+    // The stamp was claimed a moment ago and is gone: the dataset was deleted in between (the deletion
+    // cascades its stamps). Nothing was created, no hold was taken, and there is no tuple left to hold.
+    console.error(`[compute-pipeline] stamp_gone stamp=${stampId}`);
+    return fail("dataset_not_eligible", datasetId, { version: tag });
+  }
   const key = await pipelineKey(stamp);
 
   // The job, from the specification built above. The stamp is ended whatever happens next.
@@ -591,6 +621,10 @@ export interface SyncResult {
   failed: number;
   /** Stamps with a job that was created but never linked, found again by its key. */
   linked: number;
+  /** Stamps left open because what decides them could not be read yet (the next sync tries again). */
+  later: number;
+  /** Stamps whose sync threw (a database fault, say): left as they were, and counted so the line is not blind to them. */
+  errored: number;
 }
 
 /** The open stamps, oldest update first: the partial index `compute_pipeline_stamps_open` serves it. */
@@ -679,7 +713,14 @@ export async function syncPipelineStamps(
   limit: number = SYNC_STAMPS_PER_CALL,
 ): Promise<SyncResult> {
   const db = env.DB;
-  const result: SyncResult = { examined: 0, succeeded: 0, failed: 0, linked: 0 };
+  const result: SyncResult = {
+    examined: 0,
+    succeeded: 0,
+    failed: 0,
+    linked: 0,
+    later: 0,
+    errored: 0,
+  };
   const open = (await db.prepare(OPEN_STAMPS_SQL).bind(limit).all<StampRow>()).results;
   for (const stamp of open) {
     result.examined++;
@@ -732,6 +773,7 @@ export async function syncPipelineStamps(
         console.error(
           `[compute-pipeline] sync_later stamp=${stamp.id} dataset=${stamp.dataset_id} reason=${read.reason}`,
         );
+        result.later++;
         continue;
       }
       if (read.kind === "failed") {
@@ -783,6 +825,7 @@ export async function syncPipelineStamps(
       console.error(
         `[compute-pipeline] sync_failed stamp=${stamp.id} error=${err instanceof Error ? err.name : "unknown"}`,
       );
+      result.errored++;
     }
   }
   return result;
@@ -872,14 +915,14 @@ export async function pipelineCandidates(
                 SELECT 1 FROM compute_pipeline_stamps f
                  WHERE f.dataset_id = d.dataset_id AND f.recipe = ?2 AND f.recipe_version = ?3
                    AND f.engine = ?4 AND f.state = 'failed'
-                   AND f.refusal_code NOT IN (${NON_DATASET_FAILURE_SQL})
+                   AND ${COUNTS_AS_FAILURE_SQL("f")}
                    AND f.updated_at >= datetime('now', ?6)
                    AND f.version = ${VERSION_TAG_SQL(`(${NEWEST_VERSION_SQL("f")})`)})
               AND (
                 SELECT COUNT(*) FROM compute_pipeline_stamps c
                  WHERE c.dataset_id = d.dataset_id AND c.recipe = ?2 AND c.recipe_version = ?3
                    AND c.engine = ?4 AND c.state = 'failed'
-                   AND c.refusal_code NOT IN (${NON_DATASET_FAILURE_SQL})
+                   AND ${COUNTS_AS_FAILURE_SQL("c")}
                    AND c.version = ${VERSION_TAG_SQL(`(${NEWEST_VERSION_SQL("c")})`)}) < ?7
             ORDER BY d.dataset_id LIMIT ?5`,
         )

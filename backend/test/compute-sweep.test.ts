@@ -16,6 +16,7 @@
  */
 
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { sendAccessReport } from "../src/services/access-attributes";
 import { runComputeAdvanceCron, sweepComputeCancellations } from "../src/services/compute-advance";
 import {
   advanceComputeJob,
@@ -241,6 +242,72 @@ describe("a job that skipped the reservation", () => {
         account_id: null,
       });
     }
+  });
+
+  const reports = () =>
+    fx.harness.db
+      .query(
+        "SELECT r.job_id, r.state, r.last_error_code, j.gateway_user, j.tapis_uuid FROM compute_access_reports r JOIN compute_jobs j ON j.id = r.job_id",
+      )
+      .all() as Array<{
+      job_id: string;
+      state: string;
+      last_error_code: string | null;
+      gateway_user: string | null;
+      tapis_uuid: string;
+    }>;
+
+  const accessEnv = () =>
+    env({
+      ACCESS_GATEWAY_ATTRIBUTES_KEY: "access-test-key-0123456789abcdef",
+      ACCESS_RESOURCE_NAME: "example-resource-name",
+    });
+
+  test("an indexed job whose record shows a Slurm id owes an ACCESS report under its account's pseudonym (decision 9)", async () => {
+    const person = await seedUser(env().DB);
+    const pseudonym = "gw_abcdefghijklmnopqrst";
+    fx.harness.db.run(
+      "INSERT INTO compute_gateway_users (account_id, gateway_user) VALUES (?, ?)",
+      [person, pseudonym],
+    );
+    const uuid = await foreign({ owner: pseudonym, startedMsAgo: 30 * MINUTE });
+    await sweepTenantJobs(env(), "live");
+    expect(reports()).toEqual([
+      expect.objectContaining({ tapis_uuid: uuid, state: "pending", gateway_user: pseudonym }),
+    ]);
+    // Running the sweep again adds nothing.
+    await sweepTenantJobs(env(), "week");
+    expect(reports()).toHaveLength(1);
+  });
+
+  test("the report is owed from the moment the row is written, not only when it closes: a row still live has it", async () => {
+    const uuid = await foreign({ startedMsAgo: 30 * MINUTE });
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 503, 1);
+    await sweepTenantJobs(env(), "live");
+    expect(row(uuid)).toMatchObject({ state: "running" });
+    expect(reports()).toEqual([expect.objectContaining({ tapis_uuid: uuid, state: "pending" })]);
+  });
+
+  test("a partner job that maps to no account is reported `no_gateway_user`, so the gap is visible", async () => {
+    const uuid = await foreign({ owner: "someone-elses-user", startedMsAgo: 30 * MINUTE });
+    await sweepTenantJobs(env(), "live");
+    const [only] = reports();
+    expect(only).toMatchObject({ tapis_uuid: uuid, state: "pending", gateway_user: null });
+    expect(await sendAccessReport(accessEnv(), only?.job_id as string)).toBe("no_gateway_user");
+    expect(reports()[0]).toMatchObject({ state: "failed", last_error_code: "no_gateway_user" });
+  });
+
+  test("a Slurm id that first shows at the END of the row's life still owes its report (the close makes it)", async () => {
+    const uuid = await foreign();
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 503, 1);
+    await sweepTenantJobs(env(), "live");
+    expect(row(uuid)?.slurm_job_id).toBeNull();
+    expect(reports()).toHaveLength(0);
+    const record = fx.tapis.jobs.get(uuid)?.record;
+    if (record) record.remoteJobId = "4242424";
+    await sweepTenantJobs(env(), "live");
+    expect(row(uuid)).toMatchObject({ state: "cancelled", slurm_job_id: "4242424" });
+    expect(reports()).toEqual([expect.objectContaining({ tapis_uuid: uuid, state: "pending" })]);
   });
 
   test("a job that never started is cancelled and recorded, and used nothing", async () => {
@@ -617,8 +684,8 @@ describe("the listing", () => {
     expect(query.get("skip")).toBe("0");
   });
 
-  test("five full pages are read and no more, the cut-off is reported at error level, and nothing past it is invented (MUTATION: read on past five)", async () => {
-    // Five pages of 1,000 ended jobs: every page is full, so there may be more behind the fifth.
+  /** Five full pages of ended jobs; `liveOnLast` replaces one of the last page's jobs by the given record. */
+  function fivePages(liveOnLast?: { uuid: string; status: string }) {
     const ended = (page: number) =>
       Array.from({ length: 1000 }, (_, i) => ({
         uuid: `00000000-0000-0000-${String(page).padStart(4, "0")}-${String(i).padStart(12, "0")}-007`,
@@ -627,13 +694,21 @@ describe("the listing", () => {
         created: new Date().toISOString(),
       }));
     for (let page = 0; page < 5; page++) {
+      const jobs = ended(page);
+      if (page === 4 && liveOnLast) {
+        jobs[999] = { ...jobs[999], ...liveOnLast } as (typeof jobs)[number];
+      }
       fx.tapis.respond("GET /v3/jobs/list", 200, {
         status: "success",
         message: "ok",
         version: "1",
-        result: ended(page),
+        result: jobs,
       });
     }
+  }
+
+  test("five full pages are read and no more, and nothing past the cut is invented (MUTATION: read on past five)", async () => {
+    fivePages();
     const result = await sweepTenantJobs(env(), "live");
     expect(listCalls()).toHaveLength(5);
     expect(listCalls().map((c) => new URL(`http://x${c.path}`).searchParams.get("skip"))).toEqual([
@@ -644,6 +719,35 @@ describe("the listing", () => {
       "4000",
     ]);
     expect(result).toMatchObject({ listed: 5000, truncated: true, indexed: 0 });
+  }, 30_000);
+
+  test("a live pass cut off over ended jobs only is not a problem: no live job can hide behind it (MUTATION: raise on every cut)", async () => {
+    fivePages();
+    const result = await sweepTenantJobs(env(), "live");
+    expect(result).toMatchObject({ truncated: true, liveMayHide: false });
+    expect(result ? tenantLogLine(result) : "missing").toBeNull();
+  }, 30_000);
+
+  test("a live pass whose last page still holds a job that has not ended says so at error level, since an older live job could hide (MUTATION: ignore the last page)", async () => {
+    const made = await makeJob(fx);
+    expect(await submitComputeJob(made.env, made.job.id)).toEqual({
+      ok: true,
+      outcome: "submitted",
+    });
+    const uuid = (await reread(made.env, made.job.id)).tapis_uuid as string;
+    fivePages({ uuid, status: "RUNNING" });
+    const result = await sweepTenantJobs(env(), "live");
+    expect(result).toMatchObject({ truncated: true, liveMayHide: true, errors: [] });
+    const log = result ? tenantLogLine(result) : null;
+    expect(log?.level).toBe("error");
+    expect(log?.line).toContain("truncated=1");
+    expect(log?.line).toContain("live_may_hide=1");
+  }, 30_000);
+
+  test("a week pass cut off is a problem whatever the last page holds: a job of the week may be missing", async () => {
+    fivePages();
+    const result = await sweepTenantJobs(env(), "week");
+    expect(result).toMatchObject({ truncated: true, liveMayHide: false });
     const log = result ? tenantLogLine(result) : null;
     expect(log?.level).toBe("error");
     expect(log?.line).toContain("truncated=1");

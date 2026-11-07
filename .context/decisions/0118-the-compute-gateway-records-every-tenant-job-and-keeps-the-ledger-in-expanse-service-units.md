@@ -52,6 +52,7 @@ Tapis has no allocations and no idempotency key, signs no webhook, lets a job's 
    So the classification is a REQUIREMENT on that route, which must call the same eligibility check before it creates a job (the hand-off is on #2024), and until it does, `dataset_not_found` and the manifest-too-large case are declared as the platform's only because the one submitter that is reachable, NEMAR's own pipeline, passes the gate; a person's job cannot reach them yet.
    `isPlatformFailure(code, detail)` follows it: a platform detail is refunded even under `runtime_error` **["refunded" superseded by the A5 amendment of 2026-11-04 (#2010), item 1: it is attributed to the platform, flagged, and not refunded]**, a submitter detail is charged even under `code_fetch_failed` or `dataset_fetch_failed`, and a missing or undeclared detail leaves the code alone to decide, as before.
    The result refusal details stay as they were.
+   [The platform failure CODES, which `isPlatformFailure` also reads, are now twelve: `tapis_record_lost` is the twelfth (a live job whose Tapis record is gone; "Review fixes of 2026-11-06", item 10). It settles by the row's evidence of use, and a charged lost job is flagged `mismatch`.]
    The Worker's own cancel record overrules the launcher's `terminated` detail, because the launcher cannot tell a cancel by the person from a Slurm preemption.
    The default for an undeclared `runtime_error` detail is deliberate: it is charged, which is the unfavourable direction for a fault NEMAR caused.
    So a launcher change that adds a detail word lands with its entry here, in both repositories, in the same pair of pull requests, and the launcher's drift test compares its `LAUNCHER_DETAILS` with this list for each code at a pinned commit.
@@ -576,3 +577,86 @@ This amendment supersedes the wire described in item 4 of the amendment of 2026-
    The observer is not changed here; the dispatch phase has to choose between a row cap in the observer, a larger Worker bound, or accepting the refusal and re-reading the day in parts.
 8. **Not verified.** The observer's formats were written from the Slurm manual and the public user guide, not captured from a cluster (nemar-process `docs/unverified.md`), so this schema describes what the observer emits and not what a cluster has been seen to print.
    A quick post is made every 15 minutes and a token is good for one post, so a token per quick run must be minted; that is the operator's procedure and is not decided here.
+
+## Review fixes of 2026-11-06 (implementer A)
+
+The three-reviewer review of the epic's pull request found money loops and silent failures in the compute services.
+Each item below says what changed and what was decided; the owner decisions of 2026-11-06 are final.
+
+1. **The Workers subrequest limit for the compute crons is 10,000, not the project's older 1,000.**
+   The 1,000-subrequest model used elsewhere in this project is not the compute limit, and the compute crons are NOT restructured and get no shared operation budget.
+   The first week's observability counts (the per-tick lines of the advance, cancellation, tenant, pipeline and ACCESS crons) should confirm the larger limit; a count that approaches it is a reason to reopen this, not to guess.
+2. **An ACCESS report whose call never left the Worker is retried, not ended `outcome_unknown`.**
+   A throw of `fetch` was classified as no answer, and no answer is never resent, so a call the runtime refused before it was made (the invocation's subrequest limit) lost its report for good.
+   The runtime gives no code or class for that refusal, only its message, so `throwedBeforeSend` recognizes exactly that message (a closed list) and nothing else.
+   A timeout, a reset, a refused or lost connection and every other throw stay unknown and are never resent: a runtime cannot tell them from a reset after the request left, and ACCESS is not known to ignore a duplicate.
+   The conservative choice is therefore explicit: only a throw that proves nothing was sent is retried, through the ordinary retry (an attempt is spent, the delay applies, the bound still ends it, the word is `unavailable`), and the tick stops claiming after one, since every later row would meet the same limit.
+3. **An observer run is spent before its rows are stored; the re-mint path is manual and is documented.**
+   `CLAIM_RUN_SQL` spends the run, then the rows are stored; the run is reopened only when the store throws.
+   A worker that is killed between the two leaves a run `ingested` with no rows, and the token is good for one post.
+   The recovery is to mint a new run (`POST /admin/compute/observer-runs`) and post again; the stored rows are keyed by Slurm job id and the upsert is idempotent, so a repeated day is safe.
+   Nothing is redesigned.
+   A run left `ingested` with no stored rows is the signal to look for in the observer-runs listing; the listing is the reporting module's, and the count is not added here.
+   The public runbook on docs.nemar.org should carry the same two sentences.
+4. **A run that failed AFTER consuming units counts toward the pipeline's cooldown and cap.**
+   `result_upload_failed` and `result_verification_failed` (the job ran, then its results could not be taken or checked), `tapis_record_lost`, and any `failed` job whose row was charged above 0, are no longer on the list of failures that are not the dataset's (`NON_DATASET_FAILURE_WORDS`): they count toward the 7-day cooldown and the 3-failure cap like a failure the dataset caused, so the queue no longer sends the same dataset again every day with nothing to stop it.
+   A failure before any charge (staging, `tapis_submit_failed`, `submit_timeout`) stays an immediate candidate.
+   The charge is read from the stamp's linked job row, in the same SQL that decides the candidates.
+5. **The tenant sweep owes the ACCESS report for the jobs it indexes (decision 9).**
+   A tenant job that skipped the reservation now gets its pseudonym copied from `compute_gateway_users` when its owner maps to an active account, and a report row in the same batch as the index row (and at its close, for a Slurm id that first shows then), by the statement the lifecycle uses.
+   A job whose owner maps to no account has no pseudonym, so its report ends `failed` with `no_gateway_user` and the gap is visible; the partner contract still has to supply a pseudonym for account-less partner jobs.
+6. **A cut-off tenant listing needs a person only when a live job could be hiding.**
+   The listing is newest first and at most 5,000 jobs.
+   A `live` pass raises `needsPerson` for a cut only when the last page it read still held a job that has not ended (`liveMayHide`); a tenant that has simply run more than 5,000 jobs no longer raises it for ever.
+   A `week` pass still raises it on any cut, since a job of the week may be missing.
+   The line carries `live_may_hide`.
+7. **Retention reads the hold between the two prefixes.**
+   Stage 1 deletes `records/<id>/` and then `logs/<id>/`.
+   A hold placed after the first read and during the first delete now keeps the logs, because the hold is read again between the two; the reducing statement already guarded the row.
+8. **A Tapis cancel that failed is counted, and loud while it persists.**
+   `driveCancel` and `retryOrphanCancel` return an outcome (`ended`, `pending`, `failed`, `skipped`) instead of nothing.
+   The cancel sweep counts `cancel_failed` (a count, never a job id or an account) and logs at error level when it is above 0, so a persistent failure is loud on every tick it persists, and a transient failure the next tick cures is one line.
+   `cancel_pending_failed` counts live rows whose recorded cancel is still not carried out an hour after it was asked for (`countCancelPendingFailed`); the status view will carry it once the reporting changes that wire it are merged.
+   An orphan's cancel (a Tapis job NEMAR made that no row owns) now clears the record only on a 409, on a 404 that a read of the job confirms, or on a refusal after which a read shows the job has ended (a finished job may be answered with a 400): a 400 or a 403 no longer clears an orphan that is still running (this is the tenant sweep's rule).
+9. **A status Tapis reports that NEMAR does not know is treated as an unreadable record.**
+   `unknown_status` refreshes nothing, so the row's last good read ages and the job is `unreported` after a day (it used to stay live and silent for ever); the tick counts it as `unknown_status` and logs the status word shortened to 32 characters and reduced to letters and underscores.
+   It is not ended as lost: only a record that cannot be read at all is.
+10. **A live job whose Tapis record is gone ends `failed` with `tapis_record_lost` (owner decision 1 of 2026-11-06, refined in review).**
+    The word is a platform failure code (`PLATFORM_FAILURE_CODES`, so `isPlatformFailure` is true and the attribution follows).
+    Only a read that answers 404 can end a job this way; a refused credential, a response that fails its schema and a Tapis that is down for a week each leave the job `unreported` and put an error line in the tick, because a record that is merely unreadable may still be running.
+    Two things end it: a row whose last good read of Tapis is more than `UNREADABLE_GIVE_UP_DAYS` (7) days old and whose read answers 404 again; and a job with a cancel recorded whose cancel answers 404 AND whose read-back answers 404, when its last good read is more than a day old (so one wrong-tenant 404 cannot end a job at once).
+    A job Tapis has ANSWERED since its last usable read is never lost: a status NEMAR does not know leaves `tapis_synced_at` alone, so the job goes `unreported` after a day as before, and is stored in `tapis_status` (an administrator sees the word), and the stored word that names no known status is what stops the lost-by-age rule.
+    That is the clock chosen instead of a new column: no migration.
+    What the lost job settles at depends on the row, because a job that ran is never released (a release closes the hold, the ledger then refuses a charge, and the observer corrects only a row that has a `charge` entry):
+    - **evidence of a start** (`started_at` set by an earlier read): charged the time from that start to now, capped at the job's own time limit, through `provisionalCharge`, once, capped at the hold, excess to overrun as for any failed job that ran;
+    - **other evidence of use** (the launcher's bytes or completed upload, a Slurm id, or the last reported state `running` or `archiving`): the contract's minimum is charged;
+    - **no evidence of ever starting**: the hold is released with no charge, once, by the same release statement and gate as any release.
+    In every case the row is flagged `mismatch`, leaves the live states (the account's live-job slot is free), and its Tapis uuid is recorded as the row's orphan, so a job that is in fact still running is cancelled by the existing orphan retry as soon as Tapis answers a cancel.
+    A released job's later use is FLAGGED for an administrator, not reconciled: the observer cannot repair a released job and the tenant sweep skips a bound row (the repair path above says the same).
+    A pipeline stamp that reads the row fails with the same word, which counts toward the pipeline's cooldown (item 4) because the job may have run.
+    Recovery before 7 days is unchanged: a good read refreshes the clock.
+11. **A copy of the launcher files abandoned after three days is counted.**
+    `UNCOPIED_TERMINAL_SQL` stops listing a terminal row three days after it ended, and the failure used to be a log line.
+    The tick now flags such a row `mismatch` where it is not flagged already, and reports `copy_abandoned` in its result and its line at error level: the rows that are abandoned whatever their flag (a lost record is born flagged and is abandoned all the same) whose window closed in the last 30 days, so the line is an error on every tick for a month and then stops.
+    `countCopyAbandoned` is the running total with no age limit; the status view will carry it once the reporting changes that wire it are merged.
+12. **The tick's line says what it did.**
+    A tick where Tapis could not be read for a row is a `warn` line (it used to log nothing when nothing else happened); `unknown_status` and a repair that did not finish are `warn`; a failed step and an abandoned copy are `error`.
+    `repaired` counts only a repair that finished what was owed (`repairTerminal` returns the real outcome); an attempt that left something owed is `repair_attempted`.
+    The pipeline dispatch line adds `synced_later` and `synced_errored` (a sync that could not decide yet, and one that threw) when they are above 0.
+13. **Tapis answers that are a proxy's, not Tapis's decision, are transient.**
+    A 408 and any 3xx (a redirect is never followed) map to `unavailable`, not `rejected`.
+    A submit that met a proxy's 302 or 408 ended the job for ever as `tapis_submit_failed`; it now stays `created` and the next tick looks the job up by its tag.
+    400, 405 and 409 stay `rejected`.
+14. **A fault reading the owner's policy on the outputs route is `policy_unavailable` (503), not `compute_disabled`.**
+    `compute_disabled` says the platform is switched off, which a caller may take as final; the new word is a refusal code of its own with the same status and its own sentence.
+    The launcher's reaction to an unknown 503 word is the launcher's (nemar-process) to confirm; the contract declares no retryable word of its own for this.
+    `mintResultLinks` still answers `results_expired` for a declared file that is invalid or unreadable: no distinct word is declared for it, so it is left and noted here.
+15. **Code that is declared and not wired is marked.**
+    The `uploading` state has no writer, and `presignIncomingUploads`, `finalizeBundle` and `finalizeSubmittedFiles` have no caller: Epic D's partner contract wires them, and each now says so in a comment.
+    `compute_jobs.legal_hold` is unused (always 0); the hold that counts is a row of `compute_legal_holds`, read by `heldSql`.
+    The comment of migration 0115 that said the retention sweep honours the column was wrong and is corrected (comment only).
+16. **`GET /admin/compute/pipeline/status` writes, and read-only maintenance mode lets it through.**
+    The route syncs the pipeline stamps (`syncPipelineStamps`, a write that finishes stamps whose job ended) before it reads, because the status view must show the state of the jobs and not the state of the last cron.
+    A GET that writes is an exception to the rule that read-only mode refuses writes; the middleware admits it because it is a GET.
+    The write is the same, idempotent sync the cron makes, it touches only stamps and never a job, a hold or the ledger, and a repeated read changes nothing.
+    The route header should say so in a sentence; it is added with the change that owns that route file.

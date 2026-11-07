@@ -112,7 +112,8 @@ describe("the orphan list and the cancel list rotate (open points)", () => {
       ids.push(made.job.id);
     }
     fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 503, 100);
-    await sweepComputeCancellations(env());
+    // Every orphan's cancel failed, and each failure is counted (an orphan still running spends the pool).
+    expect(await sweepComputeCancellations(env())).toMatchObject({ cancel_failed: 10 });
     const stamped = () =>
       ids.filter(
         (id) =>
@@ -180,6 +181,72 @@ describe("a row has one orphan slot, and a second orphan is not lost silently", 
     expect(after.flag_mismatch).toBe(1);
     // The same uuid again is not a second orphan.
     expect(await recordOrphan(made.env, made.job.id, "first-uuid")).toBe(true);
+  });
+});
+
+describe("an orphan's cancel clears the record only when the orphan is known to be over", () => {
+  /** A row that owes the cancel of a Tapis job NEMAR made, which is a REAL job in the stand-in unless `uuid` says otherwise. */
+  async function orphanOf(uuid?: string) {
+    const made = await makeJob(fx);
+    expect(await submitComputeJob(made.env, made.job.id)).toEqual({
+      ok: true,
+      outcome: "submitted",
+    });
+    const real = (await reread(made.env, made.job.id)).tapis_uuid as string;
+    // The row ends elsewhere; the Tapis job it made is the orphan.
+    fx.harness.db.run("UPDATE compute_jobs SET orphan_tapis_uuid = ? WHERE id = ?", [
+      uuid ?? real,
+      made.job.id,
+    ]);
+    return { made, real };
+  }
+  const orphanOn = (id: string) =>
+    (
+      fx.harness.db.query("SELECT orphan_tapis_uuid FROM compute_jobs WHERE id = ?").get(id) as {
+        orphan_tapis_uuid: string | null;
+      }
+    ).orphan_tapis_uuid;
+
+  test("a 400 or a 403 is a failure: the orphan stays marked, asked again, and counted (MUTATION: clear on any `rejected`)", async () => {
+    for (const status of [400, 403]) {
+      const { made, real } = await orphanOf();
+      fx.tapis.fail("POST /v3/jobs/:uuid/cancel", status);
+      await sweepComputeCancellations(env());
+      expect([status, orphanOn(made.job.id)]).toEqual([status, real]);
+    }
+  });
+
+  test("a 409 means it is over: the record is cleared", async () => {
+    const { made } = await orphanOf();
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 409);
+    await sweepComputeCancellations(env());
+    expect(orphanOn(made.job.id)).toBeNull();
+  });
+
+  test("a refusal clears the record when a read shows the job has ENDED (a 400 for cancelling a finished job), and not while it runs (MUTATION: never read after a refusal)", async () => {
+    const { made, real } = await orphanOf();
+    fx.tapis.advance(real, "FINISHED");
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 400);
+    await sweepComputeCancellations(env());
+    expect(orphanOn(made.job.id)).toBeNull();
+    // The same refusal for a job that is still running keeps the alarm.
+    const live = await orphanOf();
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 400);
+    const swept = await sweepComputeCancellations(env());
+    expect(orphanOn(live.made.job.id)).toBe(live.real);
+    expect(swept).toMatchObject({ cancel_failed: 1 });
+  });
+
+  test("a 404 clears the record only when a read of the job confirms it is gone", async () => {
+    // Gone: the cancel and the read both answer 404.
+    const gone = await orphanOf("00000000-gone-gone-gone-000000000000");
+    await sweepComputeCancellations(env());
+    expect(orphanOn(gone.made.job.id)).toBeNull();
+    // A cancel that answers 404 for a job the read still finds is not gone.
+    const there = await orphanOf();
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 404);
+    await sweepComputeCancellations(env());
+    expect(orphanOn(there.made.job.id)).toBe(there.real);
   });
 });
 

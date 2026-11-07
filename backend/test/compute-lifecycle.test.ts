@@ -37,6 +37,7 @@ import {
   DEFAULT_COMPUTE_POLICY,
   RECORDS_RESULT_MANIFEST_FILE,
 } from "../../shared/contract/compute";
+import { ComputeJobViewSchema } from "../../shared/contract/compute-admin";
 import {
   LaunchSpecSchema,
   decodeLaunchSpecEnv,
@@ -45,15 +46,23 @@ import {
   isShellInertEnvValue,
 } from "../../shared/contract/compute-launch";
 import { resultsLauncherKey, resultsOutputKey } from "../../shared/contract/compute-launch";
-import { ADVANCE_ROWS_PER_TICK, runComputeAdvanceCron } from "../src/services/compute-advance";
-import { sweepComputeCancellations } from "../src/services/compute-advance";
+import {
+  ADVANCE_ROWS_PER_TICK,
+  cancellationsLogLine,
+  computeAdvanceLogLine,
+  runComputeAdvanceCron,
+  sweepComputeCancellations,
+} from "../src/services/compute-advance";
 import type { ComputeJobRow } from "../src/services/compute-jobs";
 import { releaseStatements, settleStatements } from "../src/services/compute-ledger";
 import {
   SETTLEMENT_GATE_SQL,
+  UNCOPIED_TERMINAL_SQL,
   advanceComputeJob,
   applyTapisJob,
   copyResultRecords,
+  countCopyAbandoned,
+  jobView,
   provisionalCharge,
   requestComputeCancel,
   sqliteTime,
@@ -489,6 +498,25 @@ describe("submit", () => {
     expect((await peopleBudget(made.env)).held_milli).toBe(0);
   });
 
+  test("a proxy's 408 or 302 on the submit is NOT a rejection: the job stays `created` with its hold, and the 400 beside it still ends it (MUTATION: map 408 and 3xx to rejected)", async () => {
+    for (const status of [408, 302]) {
+      const made = await makeJob(fx);
+      fx.tapis.fail("POST /v3/jobs/submit", status);
+      expect((await submitComputeJob(made.env, made.job.id)).outcome).toBe("unavailable");
+      const job = await reread(made.env, made.job.id);
+      expect([status, job.state, job.failure_code]).toEqual([status, "created", null]);
+      expect(kinds(await ledgerOf(made.env, job.id))).toEqual(["hold"]);
+    }
+    for (const status of [400, 405, 409]) {
+      const made = await makeJob(fx);
+      fx.tapis.fail("POST /v3/jobs/submit", status);
+      expect(await submitComputeJob(made.env, made.job.id)).toEqual({
+        ok: false,
+        outcome: "failed",
+      });
+    }
+  });
+
   test("an unavailable Tapis leaves the job `created` and the ledger as it was", async () => {
     const made = await makeJob(fx);
     fx.tapis.fail("POST /v3/jobs/submit", 503);
@@ -741,6 +769,44 @@ describe("advance", () => {
       (await applyTapisJob(s.env, job, { ...record, uuid: "another-job-007" } as never)).outcome,
     ).toBe("record_mismatch");
     expect((await reread(s.env, s.made.job.id)).state).toBe("submitted");
+  });
+
+  test("a status Tapis reports that NEMAR does not know freezes nothing: the tick counts it, logs the shortened word, and after a day the job is `unreported` (MUTATION: leave the job live without a mark)", async () => {
+    const s = await submittedJob();
+    const id = s.made.job.id;
+    await drive(s.env, id, s.uuid, "RUNNING");
+    const stored = fx.tapis.jobs.get(s.uuid);
+    if (!stored) throw new Error("no tapis job");
+    // A word from the future, with characters a log line must not carry.
+    const strange = `NEW-STATUS 9!_${"X".repeat(40)}`;
+    stored.status = strange;
+    stored.record.status = strange;
+    // Read less than a day ago: counted and warned, but not yet marked.
+    let tick = null as Awaited<ReturnType<typeof runComputeAdvanceCron>>;
+    const lines = await logged(async () => {
+      tick = await runComputeAdvanceCron(s.env);
+    });
+    expect(tick).toMatchObject({ examined: 1, unknown_status: 1, advanced: 0, errors: [] });
+    expect((await reread(s.env, id)).state).toBe("running");
+    const warned = lines.find((l) => l.includes("unknown_status"));
+    expect(warned).toBeDefined();
+    expect(warned).not.toContain(id);
+    // Stripped to letters and underscores first, then cut to 32.
+    expect(warned?.split("status=")[1]).toBe(`NEWSTATUS_${"X".repeat(22)}`);
+    expect((tick ? computeAdvanceLogLine(tick) : null)?.line).toContain("unknown_status=1");
+    // The last good read ages past the day: the job is `unreported`, and a person is told by the state.
+    await s.env.DB.prepare(
+      "UPDATE compute_jobs SET tapis_synced_at = datetime('now', '-25 hours') WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    await runComputeAdvanceCron(s.env);
+    expect((await reread(s.env, id)).state).toBe("unreported");
+    // Tapis speaks a known word again: the job returns.
+    stored.status = "RUNNING";
+    stored.record.status = "RUNNING";
+    await runComputeAdvanceCron(s.env);
+    expect((await reread(s.env, id)).state).toBe("running");
   });
 
   test("a read-back is one attempt with a short ceiling: a down Tapis is answered fast, not after retries", async () => {
@@ -1736,7 +1802,14 @@ describe("cancel", () => {
       await sweepComputeCancellations({ ...s.env, ENVIRONMENT: "staging" } as Bindings),
     ).toBeNull();
     const swept = await sweepComputeCancellations(s.env);
-    expect(swept).toMatchObject({ examined: 1, errors: [] });
+    // A TRANSIENT failure that the retry cured is quiet: the retry took the cancel.
+    expect(swept).toMatchObject({
+      examined: 1,
+      errors: [],
+      cancel_failed: 0,
+      cancel_pending_failed: 0,
+    });
+    expect(swept ? cancellationsLogLine(swept)?.level : null).toBe("info");
     job = await reread(s.env, id);
     expect(job.state).toBe("cancelled");
     // Thirty minutes of four cores, give or take the seconds the stand-in took to cancel.
@@ -1744,6 +1817,43 @@ describe("cancel", () => {
     expect(job.charged_milli).toBeLessThanOrEqual(2010);
     // Nothing is left to do, and the sweep says so.
     expect(await sweepComputeCancellations(s.env)).toMatchObject({ examined: 0 });
+  });
+
+  test("a cancel Tapis keeps refusing is LOUD on every tick it persists: counted as `cancel_failed`, logged at error level without an id, and stuck after an hour (MUTATION: count nothing, or log at info)", async () => {
+    const s = await submittedJob();
+    const id = s.made.job.id;
+    await drive(s.env, id, s.uuid, "RUNNING");
+    setTapisTimes(fx, s.uuid, 30 * MINUTE, null);
+    // The request, then three ticks, fail; the fourth tick is the retry that works.
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 503, 4);
+    await requestComputeCancel(s.env, id, "user");
+    for (const stuck of [0, 0]) {
+      const swept = await sweepComputeCancellations(s.env);
+      expect(swept).toMatchObject({
+        examined: 1,
+        errors: [],
+        cancel_failed: 1,
+        cancel_pending_failed: stuck,
+      });
+      const log = swept ? cancellationsLogLine(swept) : null;
+      expect(log?.level).toBe("error");
+      expect(log?.line).toContain("cancel_failed=1");
+      expect(log?.line).not.toContain(id);
+      expect((await reread(s.env, id)).state).toBe("running");
+    }
+    // An hour after it was asked for, a cancel still not carried out is reported as stuck.
+    await s.env.DB.prepare(
+      "UPDATE compute_jobs SET cancel_requested_at = datetime('now', '-61 minutes') WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    const third = await sweepComputeCancellations(s.env);
+    expect(third).toMatchObject({ cancel_failed: 1, cancel_pending_failed: 1 });
+    expect(third ? cancellationsLogLine(third)?.line : "").toContain("cancel_pending_failed=1");
+    // Tapis takes it on the next tick: quiet again.
+    const fourth = await sweepComputeCancellations(s.env);
+    expect(fourth).toMatchObject({ cancel_failed: 0, cancel_pending_failed: 0 });
+    expect((await reread(s.env, id)).state).toBe("cancelled");
   });
 
   test("a partner's reservation with no Tapis job is not ended by a cancel: the partner launches its own Tapis job, so the row's records prove nothing (MUTATION: drop the partner term of driveCancel, or of the sweep's list)", async () => {
@@ -2188,6 +2298,324 @@ describe("the 30-minute tick", () => {
     await runComputeAdvanceCron(s.env);
     expect((await reread(s.env, id)).state).toBe("running");
     fx.tapis.up();
+  });
+
+  /** Take the job's last good read back by `days` days: the clock the lost rules count from. */
+  async function ageRead(env: Bindings, id: string, days: number) {
+    await env.DB.prepare(
+      "UPDATE compute_jobs SET tapis_synced_at = datetime('now', ?2) WHERE id = ?1",
+    )
+      .bind(id, `-${days} days`)
+      .run();
+  }
+  const liveCount = async (env: Bindings, accountId: number) =>
+    (
+      await env.DB.prepare(
+        "SELECT COUNT(*) AS n FROM compute_jobs WHERE account_id = ?1 AND state IN ('created', 'uploading', 'submitted', 'queued', 'running', 'archiving', 'unreported')",
+      )
+        .bind(accountId)
+        .first<{ n: number }>()
+    )?.n;
+
+  test("a job that NEVER STARTED whose record answers 404 for a week ends `failed`, `tapis_record_lost`: released with no charge, once, flagged, slot freed (MUTATION: drop the week rule)", async () => {
+    const s = await submittedJob();
+    const id = s.made.job.id;
+    // Six days: unreported (a day), not lost.
+    await ageRead(s.env, id, 6);
+    fx.tapis.fail("GET /v3/jobs/:uuid", 404, 50);
+    await runComputeAdvanceCron(s.env);
+    expect((await reread(s.env, id)).state).toBe("unreported");
+    expect(kinds(await ledgerOf(s.env, id))).toEqual(["hold"]);
+    // Past the week it is lost.
+    await ageRead(s.env, id, 8);
+    const lines = await logged(async () => {
+      await runComputeAdvanceCron(s.env);
+    });
+    let job = await reread(s.env, id);
+    expect([job.state, job.failure_code, job.platform_failure, job.flag_mismatch]).toEqual([
+      "failed",
+      "tapis_record_lost",
+      1,
+      1,
+    ]);
+    expect(job.settled_provisional_at).not.toBeNull();
+    expect(job.charged_milli).toBe(0);
+    expect(job.retention_until).not.toBeNull();
+    expect(kinds(await ledgerOf(s.env, id))).toEqual(["hold", "release"]);
+    // The line names no job.
+    expect(lines.some((l) => l.includes("tapis_record_lost"))).toBe(true);
+    expect(lines.some((l) => l.includes("tapis_record_lost") && l.includes(id))).toBe(false);
+    const pool = await poolOf(s.env, s.made.accountId);
+    expect([pool.held_milli, pool.charged_milli]).toEqual([0, 0]);
+    expect((await peopleBudget(s.env)).held_milli).toBe(0);
+    // A second tick, the cascade's cancel and an admin advance change nothing: released exactly once.
+    await runComputeAdvanceCron(s.env);
+    expect(await requestComputeCancel(s.env, id, "admin")).toMatchObject({
+      ok: false,
+      outcome: "bad_state",
+    });
+    await advanceComputeJob(s.env, id);
+    job = await reread(s.env, id);
+    expect([job.state, job.failure_code]).toEqual(["failed", "tapis_record_lost"]);
+    expect(kinds(await ledgerOf(s.env, id))).toEqual(["hold", "release"]);
+    expect(await liveCount(s.env, s.made.accountId)).toBe(0);
+  });
+
+  test("a job that RAN and is then lost is CHARGED once, not released: the code's own rule is that a job that ran is never released (MUTATION: release it)", async () => {
+    const s = await submittedJob();
+    const id = s.made.job.id;
+    await drive(s.env, id, s.uuid, "RUNNING");
+    expect((await reread(s.env, id)).started_at).not.toBeNull();
+    // It started 30 minutes ago by the record; the record then goes.
+    await s.env.DB.prepare(
+      "UPDATE compute_jobs SET started_at = datetime('now', '-30 minutes') WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    await ageRead(s.env, id, 8);
+    fx.tapis.fail("GET /v3/jobs/:uuid", 404, 50);
+    await runComputeAdvanceCron(s.env);
+    let job = await reread(s.env, id);
+    expect([job.state, job.failure_code, job.flag_mismatch]).toEqual([
+      "failed",
+      "tapis_record_lost",
+      1,
+    ]);
+    expect(kinds(await ledgerOf(s.env, id))).toEqual(["hold", "charge"]);
+    // Thirty minutes of four cores is 2 SU, give or take the seconds the test took.
+    expect(job.charged_milli).toBeGreaterThanOrEqual(2000);
+    expect(job.charged_milli).toBeLessThanOrEqual(2100);
+    const pool = await poolOf(s.env, s.made.accountId);
+    expect([pool.held_milli, pool.charged_milli]).toEqual([0, job.charged_milli]);
+    expect((await peopleBudget(s.env)).held_milli).toBe(0);
+    // Idempotent: another tick and an advance charge nothing more.
+    await runComputeAdvanceCron(s.env);
+    await advanceComputeJob(s.env, id);
+    job = await reread(s.env, id);
+    expect(kinds(await ledgerOf(s.env, id))).toEqual(["hold", "charge"]);
+    expect((await poolOf(s.env, s.made.accountId)).charged_milli).toBe(job.charged_milli);
+  });
+
+  test("other evidence of use (a Slurm id) charges the contract's minimum; a lost job is never charged above the hold", async () => {
+    const s = await submittedJob();
+    const id = s.made.job.id;
+    await s.env.DB.prepare(
+      "UPDATE compute_jobs SET slurm_job_id = '4242', state = 'queued', started_at = NULL WHERE id = ?",
+    )
+      .bind(id)
+      .run();
+    await ageRead(s.env, id, 8);
+    fx.tapis.fail("GET /v3/jobs/:uuid", 404, 50);
+    await runComputeAdvanceCron(s.env);
+    const job = await reread(s.env, id);
+    expect([job.state, job.failure_code]).toEqual(["failed", "tapis_record_lost"]);
+    expect(kinds(await ledgerOf(s.env, id))).toEqual(["hold", "charge"]);
+    expect(job.charged_milli).toBeGreaterThan(0);
+    expect(job.charged_milli).toBeLessThanOrEqual(job.held_milli);
+  });
+
+  test("a read that is REFUSED, malformed or down for a week never ends a job as lost: it stays `unreported` and the line is an error (MUTATION: end on any failed read)", async () => {
+    for (const mode of ["403", "nonjson", "down"] as const) {
+      const s = await submittedJob();
+      const id = s.made.job.id;
+      await drive(s.env, id, s.uuid, "RUNNING");
+      await ageRead(s.env, id, 8);
+      if (mode === "403") fx.tapis.fail("GET /v3/jobs/:uuid", 403, 50);
+      else if (mode === "nonjson") fx.tapis.nonJson("GET /v3/jobs/:uuid", 50);
+      else fx.tapis.down();
+      const lines = await logged(async () => {
+        await runComputeAdvanceCron(s.env);
+      });
+      fx.tapis.up();
+      const job = await reread(s.env, id);
+      expect([mode, job.state, job.failure_code]).toEqual([mode, "unreported", null]);
+      expect(kinds(await ledgerOf(s.env, id))).toEqual(["hold"]);
+      expect(lines.some((l) => l.includes("unreadable_for_a_week"))).toBe(true);
+    }
+  });
+
+  test("a job Tapis ANSWERS every day with a word NEMAR does not know is never lost: a 404 after day 7 leaves it `unreported` (MUTATION: base the clock on the last usable read only)", async () => {
+    const s = await submittedJob();
+    const id = s.made.job.id;
+    await drive(s.env, id, s.uuid, "RUNNING");
+    const stored = fx.tapis.jobs.get(s.uuid);
+    if (!stored) throw new Error("no tapis job");
+    stored.status = "SOMETHING_NEW";
+    stored.record.status = "SOMETHING_NEW";
+    await ageRead(s.env, id, 8);
+    await runComputeAdvanceCron(s.env);
+    let job = await reread(s.env, id);
+    expect([job.state, job.tapis_status]).toEqual(["unreported", "SOMETHING_NEW"]);
+    // An administrator is shown the word, and the view is the contract's.
+    const view = jobView(job);
+    expect(view.tapis_status).toBe("SOMETHING_NEW");
+    expect(ComputeJobViewSchema.safeParse(view).success).toBe(true);
+    expect(view.flags).toEqual([]);
+    // The record then goes: Tapis answered, so this is not a lost record, however old the last usable read.
+    fx.tapis.fail("GET /v3/jobs/:uuid", 404, 50);
+    await runComputeAdvanceCron(s.env);
+    job = await reread(s.env, id);
+    expect([job.state, job.failure_code]).toEqual(["unreported", null]);
+    expect(kinds(await ledgerOf(s.env, id))).toEqual(["hold"]);
+  });
+
+  test("a lost job is recorded as an ORPHAN: the existing retry cancels it once Tapis answers (MUTATION: do not record it)", async () => {
+    const s = await submittedJob();
+    const id = s.made.job.id;
+    await ageRead(s.env, id, 8);
+    // The record is not served (404), but the job is in fact still there.
+    fx.tapis.fail("GET /v3/jobs/:uuid", 404, 1);
+    await runComputeAdvanceCron(s.env);
+    expect((await reread(s.env, id)).orphan_tapis_uuid).toBe(s.uuid);
+    expect(fx.tapis.jobs.get(s.uuid)?.status).not.toBe("CANCELLED");
+    const swept = await sweepComputeCancellations(s.env);
+    expect(swept).toMatchObject({ cancel_failed: 0, errors: [] });
+    expect(fx.tapis.jobs.get(s.uuid)?.status).toBe("CANCELLED");
+    expect((await reread(s.env, id)).orphan_tapis_uuid).toBeNull();
+    // Cancelled once: nothing more is asked.
+    await sweepComputeCancellations(s.env);
+    expect(fx.tapis.log.filter((r) => r.route === "POST /v3/jobs/:uuid/cancel")).toHaveLength(1);
+  });
+
+  test("a cancel that answers 404 AND a read-back that answers 404 end the job as lost, but only when its last good read is over a day old; either alone does not (MUTATION: drop the age)", async () => {
+    // 404 on the cancel only: the read finds the job, so it is not lost, and the job still runs.
+    const a = await submittedJob();
+    await drive(a.env, a.made.job.id, a.uuid, "RUNNING");
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 404);
+    await requestComputeCancel(a.env, a.made.job.id, "user");
+    const ja = await reread(a.env, a.made.job.id);
+    expect([ja.state, ja.failure_code]).toEqual(["running", null]);
+    // 404 on the read-back only: the cancel was accepted, so nothing is lost.
+    const b = await submittedJob();
+    await drive(b.env, b.made.job.id, b.uuid, "RUNNING");
+    fx.tapis.fail("GET /v3/jobs/:uuid", 404);
+    await requestComputeCancel(b.env, b.made.job.id, "user");
+    expect((await reread(b.env, b.made.job.id)).failure_code).toBeNull();
+    // Both 404 on a job read a moment ago: a wrong-tenant 404 cannot end it at once.
+    const fresh = await submittedJob();
+    await drive(fresh.env, fresh.made.job.id, fresh.uuid, "RUNNING");
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 404);
+    fx.tapis.fail("GET /v3/jobs/:uuid", 404);
+    await requestComputeCancel(fresh.env, fresh.made.job.id, "user");
+    const jf = await reread(fresh.env, fresh.made.job.id);
+    expect([jf.state, jf.failure_code]).toEqual(["running", null]);
+    // Both 404 on a job not read for two days: Tapis has no such job.
+    const c = await submittedJob();
+    await drive(c.env, c.made.job.id, c.uuid, "RUNNING");
+    await ageRead(c.env, c.made.job.id, 2);
+    fx.tapis.fail("POST /v3/jobs/:uuid/cancel", 404);
+    fx.tapis.fail("GET /v3/jobs/:uuid", 404);
+    await requestComputeCancel(c.env, c.made.job.id, "user");
+    const lost = await reread(c.env, c.made.job.id);
+    expect([lost.state, lost.failure_code, lost.flag_mismatch]).toEqual([
+      "failed",
+      "tapis_record_lost",
+      1,
+    ]);
+    // It ran (a start time was read), so it is charged, not released.
+    expect(kinds(await ledgerOf(c.env, c.made.job.id))).toEqual(["hold", "charge"]);
+  });
+
+  test("a terminal row whose copy is not made in the three days it is retried is COUNTED `copy_abandoned`, flagged for an administrator whatever its flag was, and the line is error level (MUTATION: move the boundary, count nothing, or count only unflagged rows)", async () => {
+    const inside = await submittedJob();
+    await finishJob(inside);
+    const outside = await submittedJob();
+    await finishJob(outside);
+    // Neither copy was made; one ended two days and 23 hours ago, the other three days and an hour ago.
+    for (const [s, ago] of [
+      [inside, "-71 hours"],
+      [outside, "-73 hours"],
+    ] as const) {
+      await s.env.DB.prepare(
+        "UPDATE compute_jobs SET result_records_at = NULL, ended_at = datetime('now', ?2) WHERE id = ?1",
+      )
+        .bind(s.made.job.id, ago)
+        .run();
+    }
+    expect(await countCopyAbandoned(fx.env().DB)).toBe(1);
+    // The row inside the window is on the retry list; the abandoned one is not.
+    const listed = (
+      await inside.env.DB.prepare(UNCOPIED_TERMINAL_SQL).bind(10).all<{ id: string }>()
+    ).results.map((r) => r.id);
+    expect(listed).toContain(inside.made.job.id);
+    expect(listed).not.toContain(outside.made.job.id);
+    let tick = null as Awaited<ReturnType<typeof runComputeAdvanceCron>>;
+    await logged(async () => {
+      tick = await runComputeAdvanceCron(inside.env);
+    });
+    expect(tick).toMatchObject({ copy_abandoned: 1, errors: [] });
+    const line = tick ? computeAdvanceLogLine(tick) : null;
+    expect(line?.level).toBe("error");
+    expect(line?.line).toContain("copy_abandoned=1");
+    expect(line?.line).not.toContain(outside.made.job.id);
+    // The row past the window is flagged for an administrator; the one inside it is not.
+    expect((await reread(inside.env, outside.made.job.id)).flag_mismatch).toBe(1);
+    expect((await reread(inside.env, inside.made.job.id)).flag_mismatch).toBe(0);
+    // The count does not depend on the flag: the next tick reports the row again while it is recent.
+    const again = await runComputeAdvanceCron(inside.env);
+    expect(again).toMatchObject({ copy_abandoned: 1 });
+    // A row BORN flagged (a lost record is) is abandoned all the same, flag or no flag.
+    const born = await submittedJob();
+    await finishJob(born);
+    await born.env.DB.prepare(
+      "UPDATE compute_jobs SET result_records_at = NULL, flag_mismatch = 1, ended_at = datetime('now', '-4 days') WHERE id = ?1",
+    )
+      .bind(born.made.job.id)
+      .run();
+    expect(await countCopyAbandoned(fx.env().DB)).toBe(2);
+    expect(await runComputeAdvanceCron(inside.env)).toMatchObject({ copy_abandoned: 2 });
+    // After a month the tick stops reporting it (a standing error line for years would be noise), and the
+    // running total an administrator is shown still counts it.
+    await born.env.DB.prepare(
+      "UPDATE compute_jobs SET ended_at = datetime('now', '-40 days') WHERE id = ?1",
+    )
+      .bind(born.made.job.id)
+      .run();
+    expect(await runComputeAdvanceCron(inside.env)).toMatchObject({ copy_abandoned: 1 });
+    expect(await countCopyAbandoned(fx.env().DB)).toBe(2);
+  });
+
+  test("a tick where Tapis cannot be read for ANY row still logs, at warn level (MUTATION: leave the line null)", async () => {
+    const s = await submittedJob();
+    await drive(s.env, s.made.job.id, s.uuid, "RUNNING");
+    fx.tapis.down();
+    const tick = await runComputeAdvanceCron(s.env);
+    fx.tapis.up();
+    expect(tick).toMatchObject({ examined: 1, unreachable: 1, advanced: 0, repaired: 0 });
+    const log = tick ? computeAdvanceLogLine(tick) : null;
+    expect(log?.level).toBe("warn");
+    expect(log?.line).toContain("unreachable=1");
+  });
+
+  test("`repaired` counts what a repair FINISHED: a copy that fails is `repair_attempted`, and the repair that works later is `repaired` (MUTATION: count every attempt)", async () => {
+    const s = await submittedJob();
+    await finishJob(s);
+    const id = s.made.job.id;
+    await s.env.DB.prepare("UPDATE compute_jobs SET result_records_at = NULL WHERE id = ?")
+      .bind(id)
+      .run();
+    // The copy was never made (nothing is in the records), and the bucket refuses every write.
+    for (const prefix of [`records/${id}/`, `logs/${id}/`]) {
+      const listed = await fx.harness.records.list({ prefix });
+      if (listed.objects.length > 0) {
+        await fx.harness.records.delete(listed.objects.map((o) => o.key));
+      }
+    }
+    const refusing = new Proxy(s.env.COMPUTE_RECORDS as R2Bucket, {
+      get(target, prop) {
+        if (prop === "put") return () => Promise.reject(new Error("storage fault"));
+        const value = Reflect.get(target, prop) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const failing = { ...s.env, COMPUTE_RECORDS: refusing } as Bindings;
+    const first = await runComputeAdvanceCron(failing);
+    expect(first).toMatchObject({ repaired: 0, repair_attempted: 1, errors: [] });
+    expect((await reread(s.env, id)).result_records_at).toBeNull();
+    expect((first ? computeAdvanceLogLine(first) : null)?.level).toBe("warn");
+    const second = await runComputeAdvanceCron(s.env);
+    expect(second).toMatchObject({ repaired: 1, repair_attempted: 0 });
+    expect((await reread(s.env, id)).result_records_at).not.toBeNull();
   });
 
   test("the webhook nonce is cleared one day after the job is terminal, and not before", async () => {
