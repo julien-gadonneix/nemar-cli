@@ -13,6 +13,18 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.29 - 2026-11-08
+
+0.10.28's production deploy stopped at its test gate, so this release carries the same fix with the gate made passable.
+It carries no migration, sets no Worker variable or secret, and leaves the re-pull switches and caps off.
+
+### Fixed
+
+- **The re-pull help test no longer depends on test file order (#2104).**
+  `src/lib/help.ts` replaces every "after" help text with a one-line hint once it is loaded, so the deploy gate, which runs the pure tier in one process and loads that module first, failed four cases of `test/repull-command-text.unit.test.ts` that the sharded pull request run passed.
+  The test now reads each help through the real entry point in its own process with `--help-all`.
+  There is no change to the CLI or the Worker beyond a comment on the tag read; 0.10.28's fix (the tag is read by its full ref) is what this release deploys.
+
 ## 0.10.28 - 2026-11-08
 
 A one-fix release, cut from `main` and not from `dev`, so that the first two production re-pulls can be released.
