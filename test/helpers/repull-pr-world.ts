@@ -824,7 +824,20 @@ export async function startRepullWorld(
     },
     async tagMain(version) {
       const repo = fx.originRepo;
-      await gitIn(repo, ["tag", `v${version}`, "refs/heads/main"]);
+      // Annotated, as the dataset workflow's tags are: `git ls-remote` then lists the tag object
+      // and, only when asked for by name, the commit it names (the peeled line).
+      await gitIn(repo, [
+        "-c",
+        "user.name=nemar-bot",
+        "-c",
+        "user.email=nemar-bot@users.noreply.github.com",
+        "tag",
+        "-a",
+        "-m",
+        `Release v${version}`,
+        `v${version}`,
+        "refs/heads/main",
+      ]);
       return (await gitIn(repo, ["rev-parse", `refs/tags/v${version}^{commit}`])).trim();
     },
     insertVersionRow(version) {
