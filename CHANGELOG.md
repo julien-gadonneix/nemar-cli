@@ -13,6 +13,20 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.28 - 2026-11-08
+
+A one-fix release, cut from `main` and not from `dev`, so that the first two production re-pulls can be released.
+It carries no migration, sets no Worker variable or secret, and leaves the re-pull switches and caps as they were (off and at their defaults).
+
+### Fixed
+
+- **A merged re-pull can be released: the tag is read by its full ref (#2101, #2102).**
+  The release step read the tag's commit at `commits/tags/<tag>`, and GitHub answers 422 to that spelling, so `nemar admin repull resume` refused every merged re-pull with `tag-missing` although the tag existed and pointed at the merge commit.
+  It happened to on003645 and on004362, whose records stopped at `merged`.
+  The read is now `commits/refs/tags/<tag>`.
+  Both re-pull GitHub stand-ins had accepted the short form, which is why the suites passed; they now refuse it as GitHub does, and a direct test on each pins that.
+  Until this release an automatic re-pull would have merged, minted a version DOI, and then failed to release.
+
 ## 0.10.27 - 2026-10-29
 
 The production canary and the first production re-pulls found three faults that this release fixes, and the release carries the phrase-search rework with them.
