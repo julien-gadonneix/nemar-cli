@@ -17,6 +17,7 @@ earlier releases are described only by their generated notes.
 
 A one-fix release, cut from `main` and not from `dev`, so that the first two production re-pulls can be released.
 It carries no migration, sets no Worker variable or secret, and leaves the re-pull switches and caps as they were (off and at their defaults).
+It also carries the sign-in consent copy strings that the website's `staging` branch already holds (below), because the release check compares the two repositories' copy tables and fails a pull request to `main` until they agree (ADR 0046).
 
 ### Fixed
 
@@ -26,6 +27,12 @@ It carries no migration, sets no Worker variable or secret, and leaves the re-pu
   The read is now `commits/refs/tags/<tag>`.
   Both re-pull GitHub stand-ins had accepted the short form, which is why the suites passed; they now refuse it as GitHub does, and a direct test on each pins that.
   Until this release an automatic re-pull would have merged, minted a version DOI, and then failed to release.
+
+### Changed
+
+- **The account copy table mirrors the website's sign-in copy (ADR 0119, from the sign-in epic #2014).**
+  `shared/contract/account-copy.ts` gains the `oidc.consent.*`, `oidc.rule.*` and `oidc.error.*` strings and the `{client}` and `{redirect_host}` placeholders, taken unchanged from `dev`.
+  Nothing on `main` reads them yet, so no behavior changes; the sign-in feature itself ships with the release that carries the epic.
 
 ## 0.10.27 - 2026-10-29
 
