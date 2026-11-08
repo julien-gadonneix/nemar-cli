@@ -13,6 +13,19 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.30 - 2026-11-08
+
+The first two production re-pulls met a second fault in the release step, one the stand-ins' tags hid.
+It carries no migration, sets no Worker variable or secret, and leaves the re-pull switches and caps off.
+
+### Fixed
+
+- **Release sends the commit an annotated tag names, not the tag object (#2101).**
+  After 0.10.28 the Worker could read the tag, and `nemar admin repull resume` was then refused as `tag-mismatch`: `git ls-remote origin refs/tags/v2.0.0` lists only the annotated tag's own object, and shows the peeled commit line only when `refs/tags/v2.0.0^{}` is also asked for by name.
+  The release read and the upstream-tag check in the executor now ask for both.
+  The test world's tags are annotated now, as the dataset workflow's are, so the suites read the peeled line.
+  An automatic re-pull runs the published CLI, so this release is the one that has to ship before the switches go on.
+
 ## 0.10.29 - 2026-11-08
 
 0.10.28's production deploy stopped at its test gate, so this release carries the same fix with the gate made passable.
