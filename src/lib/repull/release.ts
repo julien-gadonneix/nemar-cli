@@ -272,7 +272,10 @@ export async function releaseTurn(
   }
   let tagSha: string | undefined;
   try {
-    tagSha = (await originRefs(scratch, [tag])).get(tag);
+    // The peeled line is asked for by name: `git ls-remote` shows it for an exact ref only then,
+    // and without it an annotated tag (the dataset workflow's) answers its own object id, which
+    // is not the commit the Worker compares (tag-mismatch on the first two production re-pulls).
+    tagSha = (await originRefs(scratch, [tag, `${tag}^{}`])).get(tag);
   } catch (err) {
     if (err instanceof ExecuteRefused) err.resumable = true;
     throw err;

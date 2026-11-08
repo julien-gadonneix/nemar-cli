@@ -13,6 +13,52 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.30 - 2026-11-08
+
+The first two production re-pulls met a second fault in the release step, one the stand-ins' tags hid.
+It carries no migration, sets no Worker variable or secret, and leaves the re-pull switches and caps off.
+
+### Fixed
+
+- **Release sends the commit an annotated tag names, not the tag object (#2101).**
+  After 0.10.28 the Worker could read the tag, and `nemar admin repull resume` was then refused as `tag-mismatch`: `git ls-remote origin refs/tags/v2.0.0` lists only the annotated tag's own object, and shows the peeled commit line only when `refs/tags/v2.0.0^{}` is also asked for by name.
+  The release read and the upstream-tag check in the executor now ask for both.
+  The test world's tags are annotated now, as the dataset workflow's are, so the suites read the peeled line.
+  An automatic re-pull runs the published CLI, so this release is the one that has to ship before the switches go on.
+
+## 0.10.29 - 2026-11-08
+
+0.10.28's production deploy stopped at its test gate, so this release carries the same fix with the gate made passable.
+It carries no migration, sets no Worker variable or secret, and leaves the re-pull switches and caps off.
+
+### Fixed
+
+- **The re-pull help test no longer depends on test file order (#2104).**
+  `src/lib/help.ts` replaces every "after" help text with a one-line hint once it is loaded, so the deploy gate, which runs the pure tier in one process and loads that module first, failed four cases of `test/repull-command-text.unit.test.ts` that the sharded pull request run passed.
+  The test now reads each help through the real entry point in its own process with `--help-all`.
+  There is no change to the CLI or the Worker beyond a comment on the tag read; 0.10.28's fix (the tag is read by its full ref) is what this release deploys.
+
+## 0.10.28 - 2026-11-08
+
+A one-fix release, cut from `main` and not from `dev`, so that the first two production re-pulls can be released.
+It carries no migration, sets no Worker variable or secret, and leaves the re-pull switches and caps as they were (off and at their defaults).
+It also carries the sign-in consent copy strings that the website's `staging` branch already holds (below), because the release check compares the two repositories' copy tables and fails a pull request to `main` until they agree (ADR 0046).
+
+### Fixed
+
+- **A merged re-pull can be released: the tag is read by its full ref (#2101, #2102).**
+  The release step read the tag's commit at `commits/tags/<tag>`, and GitHub answers 422 to that spelling, so `nemar admin repull resume` refused every merged re-pull with `tag-missing` although the tag existed and pointed at the merge commit.
+  It happened to on003645 and on004362, whose records stopped at `merged`.
+  The read is now `commits/refs/tags/<tag>`.
+  Both re-pull GitHub stand-ins had accepted the short form, which is why the suites passed; they now refuse it as GitHub does, and a direct test on each pins that.
+  Until this release an automatic re-pull would have merged, minted a version DOI, and then failed to release.
+
+### Changed
+
+- **The account copy table mirrors the website's sign-in copy (ADR 0119, from the sign-in epic #2014).**
+  `shared/contract/account-copy.ts` gains the `oidc.consent.*`, `oidc.rule.*` and `oidc.error.*` strings and the `{client}` and `{redirect_host}` placeholders, taken unchanged from `dev`.
+  Nothing on `main` reads them yet, so no behavior changes; the sign-in feature itself ships with the release that carries the epic.
+
 ## 0.10.27 - 2026-10-29
 
 The production canary and the first production re-pulls found three faults that this release fixes, and the release carries the phrase-search rework with them.
