@@ -13,6 +13,22 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.32 - 2026-11-09
+
+A re-pull merged with GitHub's merge button using the merge method, which makes a two-parent commit, can now be accepted.
+It changes the Worker's acceptance route and the CLI; it carries no migration, sets no Worker variable or secret, and leaves the re-pull switches and caps as they were.
+
+### Fixed
+
+- **`--accept-merge-trailers` takes a plain merge commit of the re-pull's own pull request (#2108).**
+  The first use of the acceptance, on on000117 (re-pull #5), met a merge made with the merge method: two parents, the record's base and the pull request's head.
+  The CLI and the Worker both refused it as `merge-not-squash`, so the record stayed at `merged` and the dataset failed the fresh-clone privacy proof with no way to finish.
+  Both now accept one parent, or two with the merged head second, through one predicate, `classifyMergeParents`.
+  Every other check is unchanged: the pull request, the base, the head, the tree outside `.nemar/**` and `.github/**`, the effect on the privacy ledger, and the administrator-only rule.
+  Three or more parents stay `merge-not-squash`, and two parents whose second is not the merged head are the new `merge-second-parent-foreign`.
+  The acceptance line keeps the verification word `squash-merge-verified` for both shapes, because a ledger validator already deployed accepts that word and no other.
+  ADR 0111 has an amendment section for it.
+
 ## 0.10.31 - 2026-11-08
 
 CI and release tooling only, brought from `dev` so that `main` stops needing an administrator override and stops being slower than `dev`.
