@@ -13,6 +13,22 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## 0.10.31 - 2026-11-08
+
+CI and release tooling only, brought from `dev` so that `main` stops needing an administrator override and stops being slower than `dev`.
+It carries no migration, no change to the Worker or the CLI, sets no variable or secret, and leaves the re-pull switches as they were.
+
+### Changed
+
+- **`main` has `dev`'s CI workflows (#2106 and the work before it on `dev`).**
+  `integration-dev` runs as six shards balanced by `test/integration-timings.json` (the unsharded job took 26 minutes), and the production deploy gate runs the same six `unit-pure` shards as the pull request check plus a static leg for typecheck, lint and the process tier, so a test that depends on file order fails the pull request and not the release (what stopped 0.10.28's deploy).
+  The `process-tier` job and its lister, `scripts/ci/process-files.sh`, now exist on `main`, so every required check of branch protection runs on a pull request to `main`; until now `process-tier` did not, and each of 0.10.28 to 0.10.30 had to be merged with an override.
+  The two composite actions `install-git-annex` and `german-locale` and the classifier scripts come with them.
+  `oidc-conformance.yml` and its scripts stay on `dev` with the sign-in epic.
+- **`sync-dev` resolves a hotfix's version conflict (#2106).**
+  A hotfix released from `main` conflicts with `dev` on `package.json` and `backend/package.json`.
+  `scripts/ci/sync-dev-merge.sh` now resolves a conflict whose every conflicting hunk is a `"version"` line to `main`'s side with a three-way merge, which keeps what `dev` changed elsewhere in those files, and aborts for a person on anything else.
+
 ## 0.10.30 - 2026-11-08
 
 The first two production re-pulls met a second fault in the release step, one the stand-ins' tags hid.
