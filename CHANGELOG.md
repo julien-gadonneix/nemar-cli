@@ -63,6 +63,22 @@ Third-party compute (`nemar compute`) and the partner contract are not in this r
 - **A development target for the OpenID Connect conformance workflow (#2075).**
   The suite can run against the deployed development system; the default is unchanged.
 
+### Fixed
+
+- **A file whose name has no dot no longer gets that name appended to its checksum in `manifest.json` (#2118).**
+  git-annex keeps the whole tail of a dotless name as the key's extension and writes it straight after the digest, so `COR-001` has the key `SHA256E-s65536--<64 hex>COR-001`.
+  The parse took every hex character after `--` as the digest, and the leading `C` of `COR-001` and the `01` of `01_brain_surface` came along: 260 entries in the manifest of `on003104` at `v1.0.0` carried 65 or 66 characters instead of 64.
+  The compute launcher verifies manifest checksums and would refuse those files.
+  The digest is now cut to the backend's length, for every git-annex hash backend whose key the parser identifies (SHA256, SHA512, MD5, SHA1, the SHA3, SKEIN and BLAKE2 families, with or without the `E` suffix), and the backend name now accepts `_` and a size-less key, so `SHA3_512E` keys are no longer read as `sha256`.
+  A key of any other backend (`URL`, `WORM`, one the parser does not know) is read as before.
+  The served `manifest.json` re-derives the value from the stored key when a stored value has the wrong shape for its algorithm, so manifests already published are served correctly with no regeneration.
+  The cached `manifest.json` documents are keyed anew (`v3`), because the old ones are only revalidated against the source manifest's ETag and would otherwise keep serving the old digest for up to seven days.
+  Valid entries and `git` entries are served as before.
+  A value that still cannot be repaired is served as stored and logged as `[data] MANIFEST CHECKSUM`.
+  The in-Worker manifest builder refuses a manifest only when a key of an identified backend has a digest of the wrong length, and its error names the dataset, version, path and backend.
+  The stored manifests keep the wrong value until they are regenerated, and the central manifest workflow (a separate repository) has the same parse and does not refuse.
+  The per-file `ETag` is still built from the stored value, so it disagrees with the repaired `manifest.json` checksum until the stored manifest is regenerated.
+
 ### Deploy coupling
 
 - **Release the website first.**
@@ -88,15 +104,6 @@ It changes the Worker's acceptance route and the CLI; it carries no migration, s
   Three or more parents stay `merge-not-squash`, and two parents whose second is not the merged head are the new `merge-second-parent-foreign`.
   The acceptance line keeps the verification word `squash-merge-verified` for both shapes, because a ledger validator already deployed accepts that word and no other.
   ADR 0111 has an amendment section for it.
-- **A file whose name has no dot no longer gets that name appended to its checksum in `manifest.json` (#2118).**
-  git-annex keeps the whole tail of a dotless name as the key's extension and writes it straight after the digest, so `COR-001` has the key `SHA256E-s65536--<64 hex>COR-001`.
-  The parse took every hex character after `--` as the digest, and the leading `C` of `COR-001` and the `01` of `01_brain_surface` came along: 260 entries in the manifest of `on003104` at `v1.0.0` carried 65 or 66 characters instead of 64, and a client that verifies the checksum (the compute launcher does) refused those files.
-  The digest is now cut to the backend's length (sha256 64, md5 32, and the other fixed-length annex backends), and the served `manifest.json` re-derives the value from the stored key when a stored `sha256` or `md5` value has the wrong shape, so manifests already published are served correctly with no regeneration.
-  The cached `manifest.json` documents are keyed anew (`v3`), because the old ones are only revalidated against the source manifest's ETag and would otherwise keep serving the old digest for up to seven days.
-  Valid entries and `git` entries are served as before.
-  A value that still cannot be repaired is served as stored and logged as `[data] MANIFEST CHECKSUM`, and the in-Worker manifest builder now refuses a key whose digest is not a digest.
-  The stored manifests keep the wrong value until they are regenerated, and the central manifest workflow (a separate repository) has the same parse.
-  The per-file `ETag` is still built from the stored value.
 
 ## 0.10.31 - 2026-11-08
 
