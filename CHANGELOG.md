@@ -60,17 +60,11 @@ Third-party compute (`nemar compute`) and the partner contract are not in this r
   The tenant sweep waits for `COMPUTE_ENABLED`, and the pipeline dispatcher waits for both switches.
   Four never read a switch: job advance, cancellation retry, the ACCESS gateway-attribute reporter and retention.
   They act only on jobs and pools that exist, so they have nothing to do until the first job, and turning compute off never strands a live job.
+  NEMAR's own pipelines obey their caps on every path, fixed before this release (#2121): the live cap per pool is checked inside the statement that takes each pipeline job's hold, and an administrator's `pipeline run --eligible` also stops at what is left of the daily cap and dispatches at most 10 per invocation, reporting the room it had.
+  One named dataset is refused when its pool is full and counts toward the daily cap without being refused by it.
+  The daily dispatcher's counts and words are unchanged unless it races an administrator's run.
 - **A development target for the OpenID Connect conformance workflow (#2075).**
   The suite can run against the deployed development system; the default is unchanged.
-
-### Fixed
-
-- **NEMAR's own pipelines obey their live and daily caps on every path (#2121).**
-  An administrator's `nemar admin compute pipeline run --eligible --limit N` (N up to 100) started that many jobs: the live cap per pool and the daily cap were read only by the daily dispatcher, so the run ignored them and a run racing the dispatcher could pass them.
-  The live cap is now checked inside the statement that takes each pipeline job's hold, for every path, and a refusal is `over_concurrency`.
-  A run over the eligible datasets also stops at what is left of the daily cap (`daily_cap_reached`, new) and dispatches at most 10 per invocation; its answer and the dry run carry a `room` object saying what was left and which bound applied, and the dry run lists only what a live run would dispatch.
-  One named dataset is refused when its pool is full and counts toward the daily cap without being refused by it.
-  Nothing changes for the daily dispatcher, and nothing runs while the two compute switches are absent.
 
 ### Deploy coupling
 

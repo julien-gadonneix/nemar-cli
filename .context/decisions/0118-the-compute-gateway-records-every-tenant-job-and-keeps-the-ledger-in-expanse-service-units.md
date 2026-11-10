@@ -674,13 +674,18 @@ The owner ruled that the administrator's run obeys the same limits.
 2. **The daily cap is a clamp, not a guard.**
    `pipelineRoom(db, policy, pool)` (`compute-pipeline.ts`) is the one reading of both caps, used by the cron, the administrator's run and the dry run.
    `dispatchEligible` tries at most `min(limit, COMPUTE_PIPELINE_RUN_PER_INVOCATION, daily_left, live_left)` datasets for every actor.
-   When the room is 0, or a cap and not the number asked for ended the run, it stops with `over_concurrency` (the live cap) or the new word `daily_cap_reached` (409, pipelines only).
-   Two runs that race can together pass the daily cap by up to one bound each, because a single named dataset must stay allowed over it and the hold cannot tell the two apart.
+   When the room is 0, or a cap and not the number asked for ended the run, it stops with `over_concurrency` (the live cap) or the new word `daily_cap_reached` (409, pipelines only; no path answers it as an HTTP status today, it is a `stopped_by` of a 200 or 201 run).
+   It stays a clamp in P1 for two reasons.
+   `PIPELINE_JOBS_TODAY_SQL` is a full scan of `compute_jobs`, which a guard would run inside every pipeline hold's write, and the alternatives (an account-bound count served by `compute_jobs_account_created`, or a new index) need an account bind or a migration that P1 does not have.
+   A guard could be passed through `dispatchPipelineJob` into `createJob` (the third-party branch does this for a client's day as `CLIENT_DAY_GUARD_SQL`), so the clamp is a choice of P1 and not a limit of the hold.
+   Runs that race can therefore pass the daily cap by up to (the number of racing runs minus 1) times min(10, the daily room, the live room).
+   The money ceiling is another fence: the pipelines pool's balance, enforced atomically by the same hold (`HOLD_INSERT_SQL`; pipelines have no budget pool), although an overrun can push it below zero; the caps only pace spending.
+   An atomic daily guard, if wanted, belongs in P2 beside the tenant-ceiling guard, with an account-bound count.
 3. **The per-invocation bound is 10** (`COMPUTE_PIPELINE_RUN_PER_INVOCATION`, equal to the cron's tick bound).
    A Worker request cannot be trusted to carry 100 dispatches (about 25 subrequests each, and each waits on the job platform in turn).
    Whether the compute limit of item 1 of the review fixes of 2026-11-06 applies to this route has not been measured, so the bound is conservative and raising it needs a measurement.
    A run that wants more is asked again; the answer's `room.limited_by` says it was the bound.
-4. **A single named dataset** is bounded by the live guard (`over_concurrency`, 409, when the pool is full) and counts toward the daily cap without being refused by it; the owner may rule otherwise later.
+4. **A single named dataset** is bounded by the live guard (`over_concurrency`, 409, when the pool is full) and by the pool's balance, and counts toward the daily cap without being refused by it; the owner ruled this for P1 and may rule otherwise later.
 5. **What an administrator sees.**
    A run's answer and a dry run's carry `room { daily_left, live_left, limited_by }`, `limited_by` being one of `limit`, `per_invocation`, `daily_cap`, `live_cap` (the first of these on a tie).
    A dry run trims `would_dispatch` to the room, so the preview is what a live run would do; for a named dataset on a full pool it reports `blocked: over_concurrency`.
