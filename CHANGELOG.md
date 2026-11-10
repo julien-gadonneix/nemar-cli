@@ -13,6 +13,53 @@ what merged, and this file says what it meant.
 Newest first. Dates are the tag's publication date, UTC. Backfilled from 0.9.16 onward;
 earlier releases are described only by their generated notes.
 
+## Unreleased
+
+NEMAR can now act as an OpenID Connect provider (epic #2014), and the first-party half of the compute gateway is in the code (epic #2005).
+Both stay inert in production until the owner switches them on: the OpenID Connect surface answers 404 until `OIDC_SECRET` is set, and no job can be submitted, no tenant is contacted and no pipeline is dispatched while the two compute switches are absent.
+The release has twelve migrations, 0114 to 0119 (compute), 0120 to 0124 (OpenID Connect) and 0130 (compute anonymization).
+It sets no Worker secret.
+The production Worker configuration gains the two private compute buckets as bindings and their names as variables; the buckets already exist.
+Third-party compute (`nemar compute`) and the partner contract are not in this release.
+
+### Production behavior changes
+
+- **The ORCID sign-in flow's two short-lived cookies change name at deploy (ADR 0119 rule 10).**
+  `nemar_oauth_state` and `nemar_orcid_pending` become `__Host-nemar_oauth_state` and `__Host-nemar_orcid_pending`, which a sibling host cannot set.
+  They live for minutes, so a person who starts an ORCID sign-in just before the deploy and finishes it just after may need to start again.
+  The change is not behind a flag, and the website must already accept the new pending-cookie name (see Deploy coupling).
+- **Email-code sign-in is closed outside development and test (#2112).**
+  `/auth/code/request` answers the same masked success without issuing a code, and `/auth/code/verify` answers 401, so nothing can obtain or redeem a code in production.
+  ORCID is the only upstream identity; the code path stays in the repository, dormant.
+- **The session cookie is unchanged.**
+  `__Host-nemar_session` is written only when the owner sets `HOST_PREFIXED_SESSION_COOKIE` to `"1"`, after both releases are out; the legacy `nemar_session` name keeps being read for at least 31 days after that.
+
+### Added
+
+- **NEMAR as an OpenID Connect provider (epic #2014, ADR 0119).**
+  Authorization code flow with PKCE, discovery and signing keys, authorization and consent pages, token, userinfo, revocation and introspection, refresh rotation, and back-channel logout that is queued and retried.
+  A person is identified by a stable `sub` (`nmu_` and 32 hexadecimal digits), never an email address or an ORCID iD.
+  `nemar admin oidc` registers and manages clients and keys, and ends an account's grants.
+  Every surface answers 404 until `OIDC_SECRET` is set; the secret must have the `nmsso-` form (#2074), and the authorization and consent routes also need `HOST_PREFIXED_SESSION_COOKIE`.
+  Ending a credential ends the grants minted from it, so every route that revokes credentials also ends the account's OpenID Connect grants.
+  The protocol is documented at docs.nemar.org under Sign in with NEMAR; the operator runbook is in the gated administrator section.
+- **The compute gateway's first-party half (epic #2005, ADR 0118).**
+  An allocation ledger and owner policy in service units (SU), job records with two private storage buckets, a client for the job scheduler and a stand-in for it, the job lifecycle with webhooks, settlement and results, revocation that freezes a person's pools, and NEMAR's own processing pipelines dispatched by an administrator.
+  `nemar admin compute` covers the policy, pools, status, jobs, the observer token, access decisions and `pipeline run|status`.
+  Nothing runs until the owner sets `COMPUTE_ENABLED` and `COMPUTE_PIPELINES_DISPATCH_ENABLED`, which are absent from the production configuration and pinned absent by a test; every compute cron is production-only; the pipeline dispatcher and the tenant sweep also wait for the switches, and the three that never read a switch (job advance, cancellation retry, retention) only read tables that stay empty until a job exists, so turning compute off never strands a live job.
+- **A development target for the OpenID Connect conformance workflow (#2075).**
+  The suite can run against the deployed development system; the default is unchanged.
+
+### Deploy coupling
+
+- **Release the website first.**
+  The website's `staging` carries the reader for the `__Host-` session cookie (website #499), the authorization page (#501) and the cross-site form exemption for the authorization request (#503).
+  The API must not reach production before the website has the reader, because the API moves the ORCID flow cookies at deploy.
+- **Then the API, then the owner's switches, in this order:** set `OIDC_SECRET` in the `nmsso-` form; deploy; check ORCID sign-in end to end; set `HOST_PREFIXED_SESSION_COOKIE` to `"1"`; check sign-in again.
+  Turning the cookie flag on before the website reads the new name logs everyone out of the website.
+- **Run `bun run migrations:d1-check` before the release pull request.**
+  The twelve migrations replay on real D1; one of them (0130) replaces two ledger triggers.
+
 ## 0.10.32 - 2026-11-09
 
 A re-pull merged with GitHub's merge button using the merge method, which makes a two-parent commit, can now be accepted.
