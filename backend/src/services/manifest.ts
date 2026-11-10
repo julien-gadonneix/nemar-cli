@@ -70,13 +70,93 @@ export function extractHashAlgorithm(key: string): string {
 }
 
 /**
+ * Digest length in hex characters for the annex hash backends whose length is
+ * fixed. A `...E` backend (`SHA256E`, `MD5E`) appends the file's extension to the
+ * digest, and git-annex keeps the whole tail of a name that has no dot, so a
+ * hex-looking extension runs straight into the digest:
+ * `SHA256E-s65536--<64 hex>COR-001` for `COR-001`,
+ * `SHA256E-s369273--<64 hex>01_brain_surface` for `01_brain_surface`
+ * (nemarOrg/nemar-cli#2118). The length is the only thing that tells them apart.
+ */
+const ANNEX_DIGEST_HEX_LENGTH: Readonly<Record<string, number>> = {
+  md5: 32,
+  sha1: 40,
+  sha224: 56,
+  sha256: 64,
+  sha384: 96,
+  sha512: 128,
+};
+
+/**
  * Extract the hash/checksum from an annex key.
  * Key format: SHA256E-s12345--abc123def456.ext
- * The hash is between -- and the last .ext
+ * The hash is the hex run after `--`, cut to the backend's digest length when
+ * that length is known, so an extension that starts with hex characters
+ * (`C`, `01`, `abc`) is not read as part of the digest. A run shorter than the
+ * length is returned as found; {@link isWellFormedChecksum} reports it.
  */
 export function extractChecksumFromKey(key: string): string {
   const match = key.match(/--([a-fA-F0-9]+)/);
-  return match ? match[1] : "";
+  if (!match) return "";
+  const length = ANNEX_DIGEST_HEX_LENGTH[extractHashAlgorithm(key)];
+  return length !== undefined && match[1].length > length ? match[1].slice(0, length) : match[1];
+}
+
+/**
+ * True when `value` is a plausible digest for `algorithm`: lowercase hex of the
+ * backend's length. An algorithm with no known length (`git`, `blake2b256`,
+ * anything else) is not judged and counts as well formed.
+ */
+export function isWellFormedChecksum(algorithm: string, value: string): boolean {
+  const length = ANNEX_DIGEST_HEX_LENGTH[algorithm];
+  if (length === undefined) return true;
+  return value.length === length && /^[0-9a-f]+$/.test(value);
+}
+
+/** What {@link repairStoredChecksum} decided about one stored checksum. */
+export interface CheckedChecksum {
+  value: string;
+  /** `ok`: as stored. `repaired`: re-derived from the key. `malformed`: wrong shape, no repair. */
+  status: "ok" | "repaired" | "malformed";
+}
+
+/**
+ * A manifest published before #2118 (and any a generator outside this repo
+ * still writes) can store a digest with the key's extension attached. The key
+ * is stored beside it, so the digest is re-derived from the key when, and only
+ * when, the stored value has the wrong shape for its algorithm: a well-formed
+ * value is returned untouched, so every valid entry is served byte for byte as
+ * before. A value that cannot be repaired is returned as stored and reported
+ * `malformed`; the caller decides how loudly.
+ */
+export function repairStoredChecksum(
+  algorithm: string,
+  value: string,
+  key: string | undefined,
+): CheckedChecksum {
+  if (isWellFormedChecksum(algorithm, value)) return { value, status: "ok" };
+  if (typeof key === "string" && extractHashAlgorithm(key) === algorithm) {
+    const derived = extractChecksumFromKey(key);
+    if (isWellFormedChecksum(algorithm, derived)) return { value: derived, status: "repaired" };
+  }
+  return { value, status: "malformed" };
+}
+
+/**
+ * Raised when a manifest under construction would carry a checksum that is not
+ * a digest for its algorithm, so a wrong value is refused at publish time and
+ * never reaches the data plane. Names up to three offending paths.
+ */
+export class MalformedChecksumError extends Error {
+  constructor(
+    public readonly count: number,
+    public readonly examples: readonly string[],
+  ) {
+    super(
+      `${count} annex key(s) do not carry a well-formed checksum (for example ${examples.join(", ")})`,
+    );
+    this.name = "MalformedChecksumError";
+  }
 }
 
 /**
@@ -136,6 +216,7 @@ export async function generateManifest(
   );
 
   const files: Record<string, ManifestFile> = {};
+  const malformedChecksums: string[] = [];
   // Pointer candidates whose `parseAnnexPointer` returned null — they're
   // small regular git files (README, CHANGES, dataset_description.json on
   // OpenNeuro mirrors are commonly <500 bytes), NOT annex pointers. They
@@ -158,15 +239,22 @@ export async function generateManifest(
     );
     for (const { entry, key } of results) {
       if (key) {
+        const algorithm = extractHashAlgorithm(key);
+        const digest = extractChecksumFromKey(key);
+        if (!isWellFormedChecksum(algorithm, digest)) malformedChecksums.push(entry.path);
         files[entry.path] = {
           key,
           size: extractSizeFromKey(key),
-          checksum: `${extractHashAlgorithm(key)}:${extractChecksumFromKey(key)}`,
+          checksum: `${algorithm}:${digest}`,
         };
       } else {
         nonAnnexCandidates.push(entry);
       }
     }
+  }
+
+  if (malformedChecksums.length > 0) {
+    throw new MalformedChecksumError(malformedChecksums.length, malformedChecksums.slice(0, 3));
   }
 
   // Build the regular-files set: every git-tree entry that isn't internal
