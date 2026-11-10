@@ -25,6 +25,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { DEFAULT_COMPUTE_POLICY } from "../../shared/contract/compute";
 import { ComputePipelineRunResponseSchema } from "../../shared/contract/compute-admin";
+import { PIPELINE_JOBS_TODAY_SQL } from "../src/services/compute-pipeline";
 import { runComputePipelineDispatchCron } from "../src/services/compute-pipeline-dispatch";
 import type { Bindings } from "../src/types/bindings";
 import {
@@ -312,6 +313,37 @@ describe("(e) a dry run says what a live run would do", () => {
     expect(named.body.would_dispatch).toEqual([]);
     expect(named.body.blocked).toMatchObject({ code: "over_concurrency" });
     expect(named.body.room).toMatchObject({ live_left: 0 });
+  });
+});
+
+describe("the day's count is a full table scan, so it is read once per run", () => {
+  test("an administrator's run and its dry run each scan it once", async () => {
+    await caps({ cpu: 100, daily: 100 });
+    const env = await world(ids(4));
+    let scans = 0;
+    const db = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (sql === PIPELINE_JOBS_TODAY_SQL) scans++;
+            return target.prepare(sql);
+          };
+        }
+        const value = Reflect.get(target, prop) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const counted: Bindings = { ...env, DB: db };
+    const dry = await run(
+      "admin",
+      { recipe: "nemar-floor", eligible: true, limit: 4, dry_run: true },
+      counted,
+    );
+    expect(dry.status).toBe(200);
+    expect(scans).toBe(1);
+    const live = await run("admin", { recipe: "nemar-floor", eligible: true, limit: 4 }, counted);
+    expect(live.body.dispatched).toBe(4);
+    expect(scans).toBe(2);
   });
 });
 

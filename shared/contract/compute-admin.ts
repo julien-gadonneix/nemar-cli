@@ -403,7 +403,9 @@ export const COMPUTE_PIPELINE_RUN_LIMIT_MAX = 100;
  * dataset and version reads, the claim, the job's batch and records, the submit), so 100 are about 2,500
  * against an allowance of about 1,000 per invocation in this project's older model (ADR 0118 records
  * 10,000 for the compute crons and asks for a measurement; none has been taken for this route), and each
- * one waits on the job platform in turn. Ten is also the daily dispatcher's own bound per tick; a run
+ * one waits on the job platform in turn. The count of about 25 treats every D1 and R2 binding call as a
+ * subrequest, although whether they count is UNVERIFIED (the daily dispatcher's header says the same).
+ * It is also the daily dispatcher's bound per tick (`CRON_DISPATCH_PER_TICK` is this constant); a run
  * that wants more is asked again. Raising it needs a measurement first.
  */
 export const COMPUTE_PIPELINE_RUN_PER_INVOCATION = 10;
@@ -454,6 +456,8 @@ export interface ComputePipelineRunRequest {
  *    unexpected error (500), a platform fault and not a refusal of the request.
  *  - `daily_cap_reached`: NEMAR's pipelines have made as many jobs today as the owner allows (409). It
  *    stops a run over the eligible datasets; a single named dataset is counted and never refused by it.
+ *    No path answers it as an HTTP status today: it appears only as `stopped_by` of a 200 or 201 run, and
+ *    the status is declared because every word a run can stop with has one.
  */
 export const COMPUTE_PIPELINE_ONLY_REFUSAL_STATUS = {
   recipe_not_automatic: 422,

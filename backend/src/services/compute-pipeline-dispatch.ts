@@ -52,6 +52,7 @@
  */
 
 import { COMPUTE_RECIPES, type ComputeRecipe } from "../../../shared/compute-recipes.js";
+import { COMPUTE_PIPELINE_RUN_PER_INVOCATION } from "../../../shared/contract/compute-admin.js";
 import type { Bindings } from "../types/bindings.js";
 import {
   type PipelineRefusal,
@@ -66,8 +67,12 @@ import { ComputePolicyUnreadable, getPolicy } from "./compute-policy.js";
 import { computePipelinesDispatchEnabled } from "./compute-switches.js";
 import { isExactProduction } from "./repull-switches.js";
 
-/** The most jobs one daily tick dispatches, whatever the owner's daily cap says: see COST above. */
-export const CRON_DISPATCH_PER_TICK = 10;
+/**
+ * The most jobs one daily tick dispatches, whatever the owner's daily cap says: see COST above. It IS the
+ * per-invocation bound of `dispatchEligible` (declared once in the contract), never a second number: a
+ * tick bound raised alone would be clamped per recipe by `dispatchEligible` without the tick saying why.
+ */
+export const CRON_DISPATCH_PER_TICK = COMPUTE_PIPELINE_RUN_PER_INVOCATION;
 
 /** The refusals that would repeat for every recipe and every pool: they end the run. */
 const ENDS_THE_RUN: ReadonlySet<PipelineRefusal> = new Set<PipelineRefusal>([
@@ -130,6 +135,8 @@ export async function runComputePipelineDispatchCron(
   try {
     result.synced = await syncPipelineStamps(env);
     const policy = (await getPolicy(db)).policy;
+    // The one scan of the day's count in a tick (`PIPELINE_JOBS_TODAY_SQL` is a full table scan): every
+    // recipe's room adds what this tick has dispatched to it, and `dispatchEligible` is handed the room.
     result.today = await pipelineJobsToday(db);
     let tickLeft = CRON_DISPATCH_PER_TICK;
     const refusedPools = new Set<string>();
@@ -155,7 +162,8 @@ export async function runComputePipelineDispatchCron(
       }
       // The one reading of both caps (`pipelineRoom`), shared with an administrator's run: what an
       // administrator made today and what is live now count here as they count there.
-      const { daily_left: dailyLeft, live_left: liveLeft } = await pipelineRoom(db, policy, pool);
+      const caps = await pipelineRoom(db, policy, pool, result.today + result.dispatched);
+      const { daily_left: dailyLeft, live_left: liveLeft } = caps;
       if (dailyLeft <= 0) {
         outcome.skipped = "daily_cap";
         continue;
@@ -177,6 +185,7 @@ export async function runComputePipelineDispatchCron(
         limit: room,
         actor: { kind: "cron" },
         sync: false,
+        room: caps,
       });
       outcome.dispatched = run.dispatched;
       outcome.stopped_by = run.stoppedBy;

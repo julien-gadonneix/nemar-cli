@@ -1166,16 +1166,22 @@ export interface PipelineRoom {
  * dispatcher, an administrator's run and the dry run. The live count is the statement the hold guards on
  * (`PIPELINE_LIVE_JOBS_SQL`), so the room that is read is the room that is enforced; the daily count
  * is a read and nothing more (a clamp, never a guard: see {@link dispatchEligible}).
+ *
+ * `PIPELINE_JOBS_TODAY_SQL` is a full scan of `compute_jobs` (no index serves a count by `created_at`
+ * over every account), so a caller that has the day's count already passes it as `today` and the scan is
+ * not made again: the daily dispatcher counts once per tick, and `dispatchEligible` is handed the room
+ * it computed instead of reading its own.
  */
 export async function pipelineRoom(
   db: D1Database,
   policy: ComputePolicy,
   pool: ComputePool,
+  today?: number,
 ): Promise<PipelineRoom> {
-  const today = await pipelineJobsToday(db);
+  const madeToday = today ?? (await pipelineJobsToday(db));
   const live = await countOf(db, PIPELINE_LIVE_JOBS_SQL, pool);
   return {
-    daily_left: Math.max(0, policy.pipelines.dailyJobCap - today),
+    daily_left: Math.max(0, policy.pipelines.dailyJobCap - madeToday),
     live_left: Math.max(0, policy.pipelines.maxLiveJobs[pool] - live),
   };
 }
@@ -1253,9 +1259,18 @@ export interface EligibleRun {
  * cap, and not the number asked for, ended a run that dispatched everything it tried, it stops with that
  * cap's word too (the per-invocation bound is no refusal: the run is asked again). The live cap is also a
  * guard inside every hold (`PIPELINE_LIVE_JOBS_GUARD_SQL`), so a run that raced another for the last slot
- * is refused there. The daily cap is only this read: two runs that race can together pass it by up to a
- * bound each, because a single named dataset must stay allowed over it (the owner may rule otherwise
- * later) and the hold cannot tell them apart.
+ * is refused there. The daily cap is only this read, a clamp and not a guard, for two reasons of P1:
+ * `PIPELINE_JOBS_TODAY_SQL` is a full scan of `compute_jobs` (no index serves it), which a guard would
+ * run inside every pipeline hold's write; and the ways around that (an account-bound count served by
+ * `compute_jobs_account_created`, or a new index) need an account bind or a migration, which P1 has not.
+ * So runs that race can together pass it: by up to (the number of racing runs minus 1) times
+ * min(the per-invocation bound, the daily room, the live room), the bound of one run each time. The money
+ * ceiling is a different fence: the pipelines pool's balance, enforced atomically by the same hold
+ * (`HOLD_INSERT_SQL`; pipelines have no budget pool), though an overrun can push it below zero, so both
+ * caps only pace spending. A single named dataset is bounded by the live guard and the pool's balance
+ * and is only COUNTED by the daily cap, never refused by it (the owner ruled this for P1 and may override
+ * later). An atomic daily guard, if wanted, belongs in P2 beside the tenant-ceiling guard, with an
+ * account-bound count.
  */
 export async function dispatchEligible(
   env: Bindings,
@@ -1266,6 +1281,11 @@ export async function dispatchEligible(
     after?: string;
     /** False when the caller has just synced the stamps itself (the cron, once for all its recipes). */
     sync?: boolean;
+    /**
+     * The room the caller has just read for this recipe's pool (`pipelineRoom`): used as it is, so the
+     * day's count is not scanned a second time. Without it the run reads its own.
+     */
+    room?: PipelineRoom;
   },
 ): Promise<EligibleRun> {
   const run: EligibleRun = { results: [], dispatched: 0, stoppedBy: null, room: null };
@@ -1282,8 +1302,10 @@ export async function dispatchEligible(
     run.stoppedBy = "registry_drift";
     return run;
   }
-  const policy = (await getPolicy(env.DB)).policy;
-  const room = clampRun(input.limit, await pipelineRoom(env.DB, policy, poolOfRecipe(recipe)));
+  const caps =
+    input.room ??
+    (await pipelineRoom(env.DB, (await getPolicy(env.DB)).policy, poolOfRecipe(recipe)));
+  const room = clampRun(input.limit, caps);
   run.room = room;
   if (room.attempts <= 0) {
     run.stoppedBy = stopWordOf(room.limited_by);
