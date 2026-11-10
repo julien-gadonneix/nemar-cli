@@ -92,6 +92,7 @@ It changes the Worker's acceptance route and the CLI; it carries no migration, s
   git-annex keeps the whole tail of a dotless name as the key's extension and writes it straight after the digest, so `COR-001` has the key `SHA256E-s65536--<64 hex>COR-001`.
   The parse took every hex character after `--` as the digest, and the leading `C` of `COR-001` and the `01` of `01_brain_surface` came along: 260 entries in the manifest of `on003104` at `v1.0.0` carried 65 or 66 characters instead of 64, and a client that verifies the checksum (the compute launcher does) refused those files.
   The digest is now cut to the backend's length (sha256 64, md5 32, and the other fixed-length annex backends), and the served `manifest.json` re-derives the value from the stored key when a stored `sha256` or `md5` value has the wrong shape, so manifests already published are served correctly with no regeneration.
+  The cached `manifest.json` documents are keyed anew (`v3`), because the old ones are only revalidated against the source manifest's ETag and would otherwise keep serving the old digest for up to seven days.
   Valid entries and `git` entries are served as before.
   A value that still cannot be repaired is served as stored and logged as `[data] MANIFEST CHECKSUM`, and the in-Worker manifest builder now refuses a key whose digest is not a digest.
   The stored manifests keep the wrong value until they are regenerated, and the central manifest workflow (a separate repository) has the same parse.
