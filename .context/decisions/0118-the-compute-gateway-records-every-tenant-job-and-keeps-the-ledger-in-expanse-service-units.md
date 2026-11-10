@@ -660,3 +660,29 @@ Each item below says what changed and what was decided; the owner decisions of 2
     A GET that writes is an exception to the rule that read-only mode refuses writes; the middleware admits it because it is a GET.
     The write is the same, idempotent sync the cron makes, it touches only stamps and never a job, a hold or the ledger, and a repeated read changes nothing.
     The route header should say so in a sentence; it is added with the change that owns that route file.
+
+## Amendment 2026-11-10 (#2121, phase P1): the pipelines' caps apply to every path, atomically
+
+The pipelines' two caps (`pipelines.maxLiveJobs` per pool, `pipelines.dailyJobCap`) were applied only as reads by the daily dispatcher, so an administrator's `pipeline run --eligible --limit N` (up to 100) and a run racing the cron could pass them.
+The owner ruled that the administrator's run obeys the same limits.
+
+1. **The live cap is a guard inside every pipeline hold.**
+   `createJob` adds `PIPELINE_LIVE_JOBS_GUARD_SQL` to the hold's own statement for `source = 'pipeline'`, the way the person's live-job limit is: the pipeline jobs live in the job's pool (every recipe, every live state, `created` included) must be fewer than `policy.pipelines.maxLiveJobs` of that pool.
+   A refusal is the existing `over_concurrency`, written as before (a refused hold writes no job, no ledger row and no pseudonym) and ending the stamp `refused`.
+   The count names no account: the cap is NEMAR's pipelines in total, and the same statement (`PIPELINE_LIVE_JOBS_SQL`) is what the dispatchers read, so the room that is read is the room that is enforced.
+   It is answered from a partial index of the live rows, never the whole table.
+2. **The daily cap is a clamp, not a guard.**
+   `pipelineRoom(db, policy, pool)` (`compute-pipeline.ts`) is the one reading of both caps, used by the cron, the administrator's run and the dry run.
+   `dispatchEligible` tries at most `min(limit, COMPUTE_PIPELINE_RUN_PER_INVOCATION, daily_left, live_left)` datasets for every actor.
+   When the room is 0, or a cap and not the number asked for ended the run, it stops with `over_concurrency` (the live cap) or the new word `daily_cap_reached` (409, pipelines only).
+   Two runs that race can together pass the daily cap by up to one bound each, because a single named dataset must stay allowed over it and the hold cannot tell the two apart.
+3. **The per-invocation bound is 10** (`COMPUTE_PIPELINE_RUN_PER_INVOCATION`, equal to the cron's tick bound).
+   A Worker request cannot be trusted to carry 100 dispatches (about 25 subrequests each, and each waits on the job platform in turn).
+   Whether the compute limit of item 1 of the review fixes of 2026-11-06 applies to this route has not been measured, so the bound is conservative and raising it needs a measurement.
+   A run that wants more is asked again; the answer's `room.limited_by` says it was the bound.
+4. **A single named dataset** is bounded by the live guard (`over_concurrency`, 409, when the pool is full) and counts toward the daily cap without being refused by it; the owner may rule otherwise later.
+5. **What an administrator sees.**
+   A run's answer and a dry run's carry `room { daily_left, live_left, limited_by }`, `limited_by` being one of `limit`, `per_invocation`, `daily_cap`, `live_cap` (the first of these on a tie).
+   A dry run trims `would_dispatch` to the room, so the preview is what a live run would do; for a named dataset on a full pool it reports `blocked: over_concurrency`.
+
+The decision to queue a job NEMAR cannot yet admit (rather than refuse it) is not taken here; design and open questions are in #2121.
