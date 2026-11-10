@@ -17,16 +17,24 @@
 
 import type { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
+import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { Hono } from "hono";
 import { dataRoutes } from "../src/routes/data";
 import {
+  ANNEX_DIGEST_HEX_LENGTH,
   extractChecksumFromKey,
   extractHashAlgorithm,
+  identifyAnnexBackend,
   isWellFormedChecksum,
   repairStoredChecksum,
 } from "../src/services/manifest";
+import { manifestJsonCacheKey } from "../src/services/manifest-json-cache";
 import { resetManifestAnswerMemo } from "../src/services/manifest-source";
 import type { Bindings, Variables } from "../src/types/bindings";
+import { DrainingCache } from "./helpers/cache";
 import { freshDb, realD1 } from "./helpers/d1";
 import { type S3ManifestStandin, startS3ManifestStandin } from "./helpers/s3-manifest-standin";
 
@@ -68,10 +76,88 @@ describe("extractChecksumFromKey on real annex key shapes", () => {
     expect(isWellFormedChecksum("sha256", "abc123def456")).toBe(false);
   });
 
-  test("a backend with no known length keeps the old greedy match", () => {
-    const blake = "a".repeat(64);
-    expect(extractChecksumFromKey(`BLAKE2B256E-s1--${blake}.edf`)).toBe(blake);
-    expect(extractHashAlgorithm(`BLAKE2B256E-s1--${blake}.edf`)).toBe("blake2b256");
+  test("a backend this parser does not know keeps the old greedy match, unchanged", () => {
+    const hex = "a".repeat(70);
+    expect(extractChecksumFromKey(`FUTURE256E-s1--${hex}.edf`)).toBe(hex);
+    expect(identifyAnnexBackend(`FUTURE256E-s1--${hex}.edf`)).toBeNull();
+    expect(extractHashAlgorithm(`FUTURE256E-s1--${hex}.edf`)).toBe("future256");
+  });
+
+  test("SHA1 and SHA512 are cut at 40 and 128", () => {
+    const sha1 = "11f6ad8ec52a2984abaafd7c3b516503785c2072";
+    const sha512 =
+      "a4abd4448c49562d828115d13a1fccea927f52b4d5459297f8b43e42da89238bc13626e43dcb38ddb082488927ec904fb42057443983e88585179d50551afe62";
+    expect(extractChecksumFromKey(`SHA1E-s1--${sha1}face`)).toBe(sha1);
+    expect(extractChecksumFromKey(`SHA512E-s1--${sha512}0123`)).toBe(sha512);
+    expect(extractChecksumFromKey(`SHA512-s1--${sha512}`)).toBe(sha512);
+  });
+
+  test("SHA3 backends keep their whole digest and are cut at their own length, not at 64", () => {
+    // Real `git annex calckey` output. Before the backend name allowed `_`, SHA3_512E read as
+    // sha256 and its 128-character digest was cut to 64 characters: a valid-looking wrong value.
+    const sha3_512 =
+      "0fdb27960308c51467edd49a0f5e0c434c9cca721f4c35bff005feabaf6010e777a1137ee8187c5288af57578d18d502a0bbe4c022f5587541961e10132d9834";
+    const sha3_384 =
+      "5abfc7bc2a09a612f87987ce070634a0932d31891a61a0ec598e81e6ec616c9f00f05ff627070cbf6cb0499b1c334d4d";
+    expect(extractHashAlgorithm(`SHA3_512E-s1--${sha3_512}.edf`)).toBe("sha3_512");
+    expect(extractChecksumFromKey(`SHA3_512E-s1--${sha3_512}.edf`)).toBe(sha3_512);
+    expect(extractChecksumFromKey(`SHA3_512E-s1--${sha3_512}face`)).toBe(sha3_512);
+    expect(extractChecksumFromKey(`SHA3_384E-s1--${sha3_384}01_name`)).toBe(sha3_384);
+    expect(isWellFormedChecksum("sha3_512", sha3_512)).toBe(true);
+  });
+
+  test("a size-less MD5E key is identified as md5", () => {
+    expect(identifyAnnexBackend(`MD5E--${MD5}.edf`)?.name).toBe("md5");
+    expect(extractHashAlgorithm(`MD5E--${MD5}.edf`)).toBe("md5");
+    expect(extractChecksumFromKey(`MD5E--${MD5}face`)).toBe(MD5);
+  });
+
+  test("URL and WORM keys identify no backend and are read exactly as before", () => {
+    const url = "URL--https&c%%example.org%data%file.edf";
+    const worm = "WORM-s1-m1794343621--g_WORM";
+    for (const key of [url, worm, "git:abcdef", "not a key", ""]) {
+      expect(identifyAnnexBackend(key)).toBeNull();
+    }
+    // Historic answers, kept: no label but "sha256", and the greedy hex match (none here).
+    expect(extractHashAlgorithm(url)).toBe("sha256");
+    expect(extractChecksumFromKey(url)).toBe("");
+    expect(extractHashAlgorithm(worm)).toBe("worm");
+    expect(extractChecksumFromKey(worm)).toBe("");
+    // A hex-looking run in a URL key is not cut either.
+    expect(extractChecksumFromKey(`URL--${"b".repeat(90)}`)).toBe("b".repeat(90));
+  });
+
+  test("the digest length table matches git-annex itself, for every backend, E or not", () => {
+    // Real git-annex, when installed. On a machine without it the key shapes above are the
+    // evidence; the table was produced from this very loop.
+    const probe = spawnSync("git", ["annex", "version", "--raw"], { encoding: "utf8" });
+    if (probe.status !== 0) return;
+    const dir = mkdtempSync(join(tmpdir(), "annex-lengths-"));
+    try {
+      spawnSync("git", ["init", "-q", dir]);
+      spawnSync("git", ["-C", dir, "annex", "init", "-q"]);
+      writeFileSync(join(dir, "f.edf"), "x");
+      for (const name of Object.keys(ANNEX_DIGEST_HEX_LENGTH)) {
+        for (const suffix of ["", "E"]) {
+          const backend = `${name.toUpperCase()}${suffix}`;
+          const r = spawnSync(
+            "git",
+            ["-C", dir, "annex", "calckey", "--backend", backend, "f.edf"],
+            {
+              encoding: "utf8",
+            },
+          );
+          expect(r.status).toBe(0);
+          const key = r.stdout.trim();
+          expect(identifyAnnexBackend(key)?.backend).toBe(backend);
+          const digest = key.match(/--([0-9a-f]+)/)?.[1] ?? "";
+          expect(digest.length).toBe(ANNEX_DIGEST_HEX_LENGTH[name]);
+          expect(extractChecksumFromKey(`${key}face`)).toBe(digest);
+        }
+      }
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   test("no digest at all", () => {
@@ -110,6 +196,24 @@ describe("repairStoredChecksum", () => {
     expect(repairStoredChecksum("sha256", `${COR}C`, `SHA256E-s65536--${COR}COR-001`)).toEqual({
       value: COR,
       status: "repaired",
+    });
+  });
+
+  test("an uppercase stored value is re-derived in lowercase", () => {
+    expect(repairStoredChecksum("sha256", COR.toUpperCase(), `SHA256E-s1--${COR}.edf`)).toEqual({
+      value: COR,
+      status: "repaired",
+    });
+  });
+
+  test("a key that names no hash backend is not judged: its stored label is a historic guess", () => {
+    expect(repairStoredChecksum("sha256", "", "URL--https&c%%example.org%x")).toEqual({
+      value: "",
+      status: "ok",
+    });
+    expect(repairStoredChecksum("sha256", "xyz", "WORM-s1-m2--name")).toEqual({
+      value: "xyz",
+      status: "ok",
     });
   });
 
@@ -165,6 +269,23 @@ const STORED = {
       key: "SHA256E-s10--abc123.edf",
       size: 10,
       checksum: "sha256:abc123",
+    },
+    "sub-01/eeg/upper.edf": {
+      key: `SHA256E-s10--${COR}.edf`,
+      size: 10,
+      checksum: `sha256:${COR.toUpperCase()}`,
+    },
+    // Valid for md5, not for the sha256 it says: served as stored and reported.
+    "sub-01/eeg/half.edf": {
+      key: `SHA256E-s10--${MD5}.edf`,
+      size: 10,
+      checksum: `sha256:${MD5}`,
+    },
+    // A key that names no hash backend is carried as written by older code and never reported.
+    "sub-01/eeg/remote.dat": {
+      key: "URL--https&c%%example.org%remote.dat",
+      size: 10,
+      checksum: "sha256:",
     },
     "participants.tsv": {
       key: "git:66fda97533307ffdbd0d7995ab97297aa16b54d4",
@@ -244,6 +365,11 @@ describe("manifest.json over a stored manifest written before the fix (#2118)", 
     });
   });
 
+  test("an uppercase stored value is served in lowercase", async () => {
+    const byPath = new Map((await manifestJson()).map((e) => [e.path, e]));
+    expect(byPath.get("sub-01/eeg/upper.edf")?.checksum).toBe(COR);
+  });
+
   test("valid sha256, md5 and git entries are served exactly as stored", async () => {
     const byPath = new Map((await manifestJson()).map((e) => [e.path, e]));
     expect(byPath.get("sub-01/eeg/valid.edf")).toMatchObject({
@@ -260,13 +386,20 @@ describe("manifest.json over a stored manifest written before the fix (#2118)", 
     });
   });
 
-  test("no served sha256 or md5 value has the wrong length except the one nothing can repair", async () => {
+  test("no served sha256 or md5 value has the wrong length except the ones nothing can repair or judge", async () => {
     const wrong = (await manifestJson()).filter(
       (e) =>
         (e.checksum_algorithm === "sha256" && String(e.checksum).length !== 64) ||
         (e.checksum_algorithm === "md5" && String(e.checksum).length !== 32),
     );
-    expect(wrong.map((e) => e.path)).toEqual(["sub-01/eeg/broken.edf"]);
+    expect(wrong.map((e) => e.path).sort()).toEqual([
+      "sub-01/eeg/broken.edf",
+      "sub-01/eeg/half.edf",
+      "sub-01/eeg/remote.dat",
+    ]);
+    // Served as stored, not invented.
+    const half = wrong.find((e) => e.path === "sub-01/eeg/half.edf");
+    expect(half?.checksum).toBe(MD5);
   });
 
   test("the repair and the unrepairable entry are reported, not silent", async () => {
@@ -274,8 +407,60 @@ describe("manifest.json over a stored manifest written before the fix (#2118)", 
     const line = logged.find((l) => l.includes("[data] MANIFEST CHECKSUM"));
     expect(line).toBeDefined();
     expect(line).toContain(`dataset=${ID}`);
-    expect(line).toContain("repaired=2");
-    expect(line).toContain("malformed=1");
+    expect(line).toContain("repaired=3");
+    expect(line).toContain("malformed=2");
     expect(line).toContain("first_malformed=sub-01/eeg/broken.edf");
+  });
+});
+
+describe("a manifest.json document cached under the old v2 key is not served (#2118)", () => {
+  let cache: DrainingCache;
+  let original: unknown;
+  const KEY = (v: string) =>
+    manifestJsonCacheKey("https://data.nemar.org", ID, "v1.0.0").replace("/v3/", `/${v}/`);
+
+  beforeEach(() => {
+    original = (globalThis as { caches?: unknown }).caches;
+    cache = new DrainingCache();
+    (globalThis as { caches?: unknown }).caches = { default: cache };
+  });
+
+  afterEach(() => {
+    (globalThis as { caches?: unknown }).caches = original;
+  });
+
+  /** The document the old code built and cached for the source manifest's current ETag. */
+  async function plantStale(version: "v2" | "v3"): Promise<string> {
+    await manifestJson(); // builds and stores the v3 document, whose headers carry the live ETag
+    const live = cache.store.get(KEY("v3"));
+    if (!live) throw new Error("the v3 document was not stored");
+    const stale = JSON.stringify([
+      { path: "stale/COR-001", size: 1, checksum_algorithm: "sha256", checksum: `${COR}C` },
+    ]);
+    cache.store.delete(KEY("v3"));
+    cache.store.set(KEY(version), {
+      body: new TextEncoder().encode(stale),
+      status: 200,
+      headers: live.headers,
+      storedAtMs: Date.now(),
+    });
+    resetManifestAnswerMemo();
+    return stale;
+  }
+
+  test("a v2 document with the live ETag is ignored and the repaired one is built", async () => {
+    await plantStale("v2");
+    const served = await manifestJson();
+    expect(served.map((e) => e.path)).not.toContain("stale/COR-001");
+    expect(served.find((e) => e.path === `${BASE}/ws/COR-001`)?.checksum).toBe(COR);
+    expect(cache.store.has(KEY("v3"))).toBe(true);
+  });
+
+  // Control: the same stale document under the v3 key IS served, so the test above fails
+  // for the right reason (only the key version protects, the ETag matches).
+  test("control: the same stale document under the v3 key would be served", async () => {
+    await plantStale("v3");
+    const served = await manifestJson();
+    expect(served.map((e) => e.path)).toEqual(["stale/COR-001"]);
   });
 });

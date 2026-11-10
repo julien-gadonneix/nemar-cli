@@ -28,7 +28,7 @@ import { spawn } from "bun";
  */
 const ISOLATED = process.env.MANIFEST_SMALL_ISOLATED === "1";
 /** How many tests the isolated describe holds; the wrapper requires the child to run them all. */
-const ISOLATED_TESTS = 6;
+const ISOLATED_TESTS = 7;
 
 const fakeTree: Array<{
   path: string;
@@ -215,7 +215,36 @@ describe.skipIf(!ISOLATED)("generateManifest — small root file handling (issue
     expect(err).toBeInstanceOf(MalformedChecksumError);
     const refusal = err as InstanceType<typeof MalformedChecksumError>;
     expect(refusal.count).toBe(1);
-    expect(refusal.examples).toEqual(["sub-1/eeg/short.edf"]);
+    expect(refusal.examples).toEqual([{ path: "sub-1/eeg/short.edf", backend: "SHA256E" }]);
+    // The message names the dataset, version, path and backend, and no checksum value.
+    expect(refusal.message).toContain("dataset test version v1.0.0");
+    expect(refusal.message).toContain("sub-1/eeg/short.edf [SHA256E]");
+    expect(refusal.message).not.toContain("abc123");
+  });
+
+  test("keys of no known hash backend, and size-less or SHA3 keys, are carried and never refused (#2118)", async () => {
+    const sha3 =
+      "0fdb27960308c51467edd49a0f5e0c434c9cca721f4c35bff005feabaf6010e777a1137ee8187c5288af57578d18d502a0bbe4c022f5587541961e10132d9834";
+    blob("remote/a.dat", "sha-url", 200, "/annex/objects/URL--https&c%%example.org%a.dat");
+    blob("remote/b.dat", "sha-worm", 200, "/annex/objects/WORM-s5-m1794343621--b.dat");
+    blob("remote/c.dat", "sha-future", 200, "/annex/objects/FUTURE256E-s5--abc123.dat");
+    blob("sub-1/eeg/size-less.edf", "sha-md5", 200, `/annex/objects/MD5E--${MD5_DIGEST}.edf`);
+    blob("sub-1/eeg/sha3.edf", "sha-sha3", 200, `/annex/objects/SHA3_512E-s7--${sha3}face`);
+
+    const m = await generateManifest("test/repo", "v1.0.0", "fake-pat", "test", null, null, {
+      skipGitBackedVerification: true,
+    });
+
+    expect(Object.keys(m.files).sort()).toEqual([
+      "remote/a.dat",
+      "remote/b.dat",
+      "remote/c.dat",
+      "sub-1/eeg/sha3.edf",
+      "sub-1/eeg/size-less.edf",
+    ]);
+    expect(m.files["sub-1/eeg/size-less.edf"].checksum).toBe(`md5:${MD5_DIGEST}`);
+    expect(m.files["sub-1/eeg/sha3.edf"].checksum).toBe(`sha3_512:${sha3}`);
+    expect(m.files["remote/c.dat"].checksum).toBe("future256:abc123");
   });
 });
 
