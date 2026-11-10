@@ -48,9 +48,16 @@ import {
   recipeRequiredOutputs,
 } from "../../../shared/compute-recipes.js";
 import { PLATFORM_FAILURE_CODES } from "../../../shared/compute-state.js";
+import {
+  COMPUTE_PIPELINE_RUN_PER_INVOCATION,
+  type ComputePipelineLimitedBy,
+} from "../../../shared/contract/compute-admin.js";
 import { resultsOutputKey } from "../../../shared/contract/compute-launch.js";
 import {
+  type ComputePolicy,
+  type ComputePool,
   JobSpecSchema,
+  PARTITIONS,
   PIPELINES_TAPIS_OWNER,
   type PartitionName,
   dataTagForVersion,
@@ -62,6 +69,7 @@ import {
   type ComputeJobRow,
   type CreateJobRefusal,
   JOB_BY_KEY_SQL,
+  PIPELINE_LIVE_JOBS_SQL,
   createJob,
 } from "./compute-jobs.js";
 import { type SubmitOutcome, submitComputeJob } from "./compute-lifecycle.js";
@@ -80,6 +88,7 @@ import {
   loadPipelineRow,
   pickVersion,
 } from "./compute-pipeline-eligibility.js";
+import { getPolicy } from "./compute-policy.js";
 import { sha256Hex } from "./compute-records.js";
 import { readRuntimeImage } from "./compute-runtime-image.js";
 import { computeEnabled } from "./compute-switches.js";
@@ -175,6 +184,7 @@ export type PipelineRefusal =
   | "recipe_not_automatic"
   | "recipe_placeholder"
   | "registry_drift"
+  | "daily_cap_reached"
   | "run_failed"
   | "create_failed"
   | CreateJobRefusal;
@@ -992,6 +1002,12 @@ export type DryRunResult =
       /** The datasets a run would dispatch (a named dataset that would be refused is not here). */
       would_dispatch: Array<{ dataset_id: string; version: string }>;
       /**
+       * The room a run would have in the recipe's pool and what would bound it, as a live run reads it
+       * (`clampRun`); `would_dispatch` of the queue is trimmed to it. Absent only when the recipe's tuple
+       * is held (`registry_drift`), which stops a run before the caps are read.
+       */
+      room?: { daily_left: number; live_left: number; limited_by: ComputePipelineLimitedBy };
+      /**
        * Why a named dataset would be refused, or the count of the catalog's datasets that fail each term
        * of the predicate, over every dataset the queue read. A dataset fails every term it fails, so the
        * counts add up to more than the number of datasets.
@@ -1004,8 +1020,8 @@ export type DryRunResult =
 const DRY_RUN_SCAN_ROWS = 5000;
 
 /**
- * What a run would do, with nothing written: the eligible datasets, the estimated SU per job and in
- * total, and what blocks the ineligible ones. It reads D1 and the configuration and nothing else, makes
+ * What a run would do, with nothing written: the eligible datasets (the queue trimmed to the room a live
+ * run would have, `clampRun`), the estimated SU per job and in total, and what blocks the ineligible ones. It reads D1 and the configuration and nothing else, makes
  * no stamp, no job and no hold, calls neither Tapis nor a bucket, and works in every environment
  * (a non-production Worker answers from its own catalog). For one named dataset it gives the very
  * verdict a run would (`resolveRun`, and a live stamp for the tuple); for the queue it lists the next
@@ -1032,11 +1048,21 @@ export async function pipelineDryRun(env: Bindings, input: DryRunInput): Promise
     };
   }
 
+  // The caps, read as a live run reads them.
+  const policy = (await getPolicy(db)).policy;
+  const caps = await pipelineRoom(db, policy, poolOfRecipe(recipe));
+
   if (input.datasetId !== undefined) {
+    // A named dataset is bounded by the live cap and only counted by the daily one (see `dispatchEligible`).
+    const named = {
+      ...caps,
+      limited_by: caps.live_left <= 0 ? ("live_cap" as const) : ("limit" as const),
+    };
     const resolved = await resolveRun(db, input.datasetId, input.version);
     if (!resolved.ok) {
       return {
         ...base,
+        room: named,
         estimate_milli_total: 0,
         would_dispatch: [],
         blocked: {
@@ -1057,20 +1083,31 @@ export async function pipelineDryRun(env: Bindings, input: DryRunInput): Promise
     if (live) {
       return {
         ...base,
+        room: named,
         estimate_milli_total: 0,
         would_dispatch: [],
         blocked: { code: "live_attempt_exists", blocked_by: [], version: resolved.tag },
       };
     }
+    if (caps.live_left <= 0) {
+      return {
+        ...base,
+        room: named,
+        estimate_milli_total: 0,
+        would_dispatch: [],
+        blocked: { code: "over_concurrency", blocked_by: [], version: resolved.tag },
+      };
+    }
     return {
       ...base,
+      room: named,
       estimate_milli_total: perJob,
       would_dispatch: [{ dataset_id: input.datasetId, version: resolved.tag }],
     };
   }
 
-  const limit = input.limit ?? 20;
-  const candidates = await pipelineCandidates(db, recipe, limit);
+  const room = clampRun(input.limit ?? 20, caps);
+  const candidates = room.attempts > 0 ? await pipelineCandidates(db, recipe, room.attempts) : [];
   // Everything else: what the datasets that are not eligible fail, counted per term.
   const rows = (
     await db
@@ -1087,11 +1124,103 @@ export async function pipelineDryRun(env: Bindings, input: DryRunInput): Promise
   }
   return {
     ...base,
+    room: { daily_left: room.daily_left, live_left: room.live_left, limited_by: room.limited_by },
     estimate_milli_total: perJob * candidates.length,
     would_dispatch: candidates.map((c) => ({ dataset_id: c.dataset_id, version: c.tag })),
     blocked_by_term: blockedByTerm,
   };
 }
+
+// --- The room a run has --------------------------------------------------------------------------------------
+
+/** The pool a recipe's jobs are held in, from the partition its job asks for. */
+export const poolOfRecipe = (recipe: ComputeRecipe): ComputePool =>
+  PARTITIONS[recipe.partition as PartitionName].pool;
+
+/** Pipeline jobs made today (UTC): `created_at` is `datetime('now')`, so a day starts at `date('now')`. */
+export const PIPELINE_JOBS_TODAY_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
+  WHERE source = 'pipeline' AND created_at >= date('now')`;
+
+const countOf = async (db: D1Database, sql: string, ...binds: unknown[]): Promise<number> =>
+  (
+    await db
+      .prepare(sql)
+      .bind(...binds)
+      .first<{ n: number }>()
+  )?.n ?? 0;
+
+/** Pipeline jobs made today (UTC), across every recipe and every pool, whoever dispatched them. */
+export const pipelineJobsToday = (db: D1Database): Promise<number> =>
+  countOf(db, PIPELINE_JOBS_TODAY_SQL);
+
+/** What is left of NEMAR's pipelines' two caps, read from the owner's policy, for one pool. */
+export interface PipelineRoom {
+  /** `pipelines.dailyJobCap` minus the pipeline jobs made today, never below 0. */
+  daily_left: number;
+  /** `pipelines.maxLiveJobs` of the pool minus the pipeline jobs live in it, never below 0. */
+  live_left: number;
+}
+
+/**
+ * The room the pipelines have in a pool right now: the one reading of both caps, used by the daily
+ * dispatcher, an administrator's run and the dry run. The live count is the statement the hold guards on
+ * (`PIPELINE_LIVE_JOBS_SQL`), so the room that is read is the room that is enforced; the daily count
+ * is a read and nothing more (a clamp, never a guard: see {@link dispatchEligible}).
+ *
+ * `PIPELINE_JOBS_TODAY_SQL` is a full scan of `compute_jobs` (no index serves a count by `created_at`
+ * over every account), so a caller that has the day's count already passes it as `today` and the scan is
+ * not made again: the daily dispatcher counts once per tick, and `dispatchEligible` is handed the room
+ * it computed instead of reading its own.
+ */
+export async function pipelineRoom(
+  db: D1Database,
+  policy: ComputePolicy,
+  pool: ComputePool,
+  today?: number,
+): Promise<PipelineRoom> {
+  const madeToday = today ?? (await pipelineJobsToday(db));
+  const live = await countOf(db, PIPELINE_LIVE_JOBS_SQL, pool);
+  return {
+    daily_left: Math.max(0, policy.pipelines.dailyJobCap - madeToday),
+    live_left: Math.max(0, policy.pipelines.maxLiveJobs[pool] - live),
+  };
+}
+
+/** How many datasets one run may try, and what bounded it. */
+export interface RunRoom extends PipelineRoom {
+  /** `min(limit, per-invocation bound, daily_left, live_left)`. */
+  attempts: number;
+  limited_by: ComputePipelineLimitedBy;
+}
+
+/**
+ * The number of datasets a run over the eligible ones may try: the smallest of what was asked for, the
+ * per-invocation bound (`COMPUTE_PIPELINE_RUN_PER_INVOCATION`: a Worker request cannot carry 100
+ * dispatches, about 25 subrequests each against an allowance of about 1,000), what is left of the daily
+ * cap and what is left of the pool's live cap. The same clamp serves the live run and the dry run, so a
+ * preview is what a run would do. On a tie the first of `COMPUTE_PIPELINE_LIMITED_BY` is named, so a
+ * run that ends at exactly the number it was asked for was not "limited".
+ */
+export function clampRun(limit: number, room: PipelineRoom): RunRoom {
+  const candidates: Array<[ComputePipelineLimitedBy, number]> = [
+    ["limit", limit],
+    ["per_invocation", COMPUTE_PIPELINE_RUN_PER_INVOCATION],
+    ["daily_cap", room.daily_left],
+    ["live_cap", room.live_left],
+  ];
+  let [limited_by, attempts] = candidates[0] as [ComputePipelineLimitedBy, number];
+  for (const [by, n] of candidates) {
+    if (n < attempts) {
+      attempts = n;
+      limited_by = by;
+    }
+  }
+  return { ...room, attempts, limited_by };
+}
+
+/** The word a run stops with when a cap, and not its own limit, ended it; null for the bound or the limit. */
+export const stopWordOf = (by: ComputePipelineLimitedBy): PipelineRefusal | null =>
+  by === "live_cap" ? "over_concurrency" : by === "daily_cap" ? "daily_cap_reached" : null;
 
 // --- A run over the queue ---------------------------------------------------------------------------------------
 
@@ -1114,13 +1243,34 @@ export interface EligibleRun {
   dispatched: number;
   /** The refusal that stopped the run before the limit, if one did. */
   stoppedBy: PipelineRefusal | null;
+  /** The room the run had and what bounded it; null when the run ended before it was read. */
+  room: RunRoom | null;
 }
 
 /**
- * Dispatch a recipe over the next `limit` datasets it has not been run over: the stamps are synced
- * first, candidates are taken in dataset order, and every one goes through {@link dispatchPipelineJob},
- * so each is checked again from its own row. A refusal that would repeat for the next dataset (a hold
- * refused, the switch off, no image, no account) stops the run; a refusal about one dataset does not.
+ * Dispatch a recipe over the next datasets it has not been run over: the stamps are synced first,
+ * candidates are taken in dataset order, and every one goes through {@link dispatchPipelineJob}, so each
+ * is checked again from its own row. A refusal that would repeat for the next dataset (a hold refused,
+ * the switch off, no image, no account) stops the run; a refusal about one dataset does not.
+ *
+ * THE CAPS APPLY TO EVERY ACTOR. A run tries at most `min(limit, the per-invocation bound, daily_left,
+ * live_left)` datasets (`clampRun`), read from the policy and the tables before it starts. When the
+ * room is 0 nothing is tried and the run stops with `daily_cap_reached` or `over_concurrency`; when a
+ * cap, and not the number asked for, ended a run that dispatched everything it tried, it stops with that
+ * cap's word too (the per-invocation bound is no refusal: the run is asked again). The live cap is also a
+ * guard inside every hold (`PIPELINE_LIVE_JOBS_GUARD_SQL`), so a run that raced another for the last slot
+ * is refused there. The daily cap is only this read, a clamp and not a guard, for two reasons of P1:
+ * `PIPELINE_JOBS_TODAY_SQL` is a full scan of `compute_jobs` (no index serves it), which a guard would
+ * run inside every pipeline hold's write; and the ways around that (an account-bound count served by
+ * `compute_jobs_account_created`, or a new index) need an account bind or a migration, which P1 has not.
+ * So runs that race can together pass it: by up to (the number of racing runs minus 1) times
+ * min(the per-invocation bound, the daily room, the live room), the bound of one run each time. The money
+ * ceiling is a different fence: the pipelines pool's balance, enforced atomically by the same hold
+ * (`HOLD_INSERT_SQL`; pipelines have no budget pool), though an overrun can push it below zero, so both
+ * caps only pace spending. A single named dataset is bounded by the live guard and the pool's balance
+ * and is only COUNTED by the daily cap, never refused by it (the owner ruled this for P1 and may override
+ * later). An atomic daily guard, if wanted, belongs in P2 beside the tenant-ceiling guard, with an
+ * account-bound count.
  */
 export async function dispatchEligible(
   env: Bindings,
@@ -1131,9 +1281,14 @@ export async function dispatchEligible(
     after?: string;
     /** False when the caller has just synced the stamps itself (the cron, once for all its recipes). */
     sync?: boolean;
+    /**
+     * The room the caller has just read for this recipe's pool (`pipelineRoom`): used as it is, so the
+     * day's count is not scanned a second time. Without it the run reads its own.
+     */
+    room?: PipelineRoom;
   },
 ): Promise<EligibleRun> {
-  const run: EligibleRun = { results: [], dispatched: 0, stoppedBy: null };
+  const run: EligibleRun = { results: [], dispatched: 0, stoppedBy: null, room: null };
   const recipe = findRecipe(input.recipe);
   if (recipe === null || recipe.placeholder === true) {
     const code = recipe === null ? "recipe_unknown" : "recipe_placeholder";
@@ -1147,9 +1302,18 @@ export async function dispatchEligible(
     run.stoppedBy = "registry_drift";
     return run;
   }
+  const caps =
+    input.room ??
+    (await pipelineRoom(env.DB, (await getPolicy(env.DB)).policy, poolOfRecipe(recipe)));
+  const room = clampRun(input.limit, caps);
+  run.room = room;
+  if (room.attempts <= 0) {
+    run.stoppedBy = stopWordOf(room.limited_by);
+    return run;
+  }
   try {
-    for (const candidate of await pipelineCandidates(env.DB, recipe, input.limit, input.after)) {
-      if (run.dispatched >= input.limit) break;
+    for (const candidate of await pipelineCandidates(env.DB, recipe, room.attempts, input.after)) {
+      if (run.dispatched >= room.attempts) break;
       const result = await dispatchPipelineJob(env, {
         recipe: recipe.name,
         datasetId: candidate.dataset_id,
@@ -1163,6 +1327,10 @@ export async function dispatchEligible(
         run.stoppedBy = result.code;
         break;
       }
+    }
+    // A cap ended the run, not the number asked for and not a refusal: say which cap.
+    if (run.stoppedBy === null && run.dispatched >= room.attempts) {
+      run.stoppedBy = stopWordOf(room.limited_by);
     }
   } catch (err) {
     // What was dispatched before the throw is real (jobs exist, holds are taken): the run reports it

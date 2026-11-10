@@ -49,9 +49,14 @@
  *    `compute_gateway_users` on an account's first job and copied to every job of that account, never
  *    rotated and never reused. It is random and stored, not derived from a key: a derived value would
  *    change if the key were rotated. NEMAR's own pipeline jobs carry the literal `nemar-pipelines`.
- *  - The pipelines' own caps (a daily count and a live count per pool) are the dispatch phase's, not a
- *    person's limit: a pipeline job is held on the platform `pipelines` pool, names no budget, and meets
- *    no per-person guard.
+ *  - The pipelines' own caps are not a person's limit: a pipeline job is held on the platform `pipelines`
+ *    pool, names no budget, and meets no per-person guard. It meets the pipelines' LIVE cap instead
+ *    (`PIPELINE_LIVE_JOBS_GUARD_SQL`, the owner's `pipelines.maxLiveJobs` for the job's pool, whatever the
+ *    recipe and whoever dispatches it), read inside the hold's own statement exactly as the person's
+ *    limit is, so the daily dispatcher, an administrator's run and a named dataset cannot together exceed
+ *    it however they interleave. The daily count (`pipelines.dailyJobCap`) is the dispatchers' to read
+ *    (`pipelineRoom`), not a guard: it clamps a run and does not refuse a dataset an administrator names
+ *    (issue #2121, ADR 0118 amendment of 2026-11-10).
  */
 
 import { z } from "zod";
@@ -368,6 +373,24 @@ export const TAPIS_REPORTING_STATES_SQL = sqlList(TAPIS_REPORTING_STATES);
  */
 export const LIVE_JOBS_GUARD_SQL = `(SELECT COUNT(*) FROM compute_jobs
    WHERE account_id = ? AND state IN (${LIVE_STATES_SQL})) < ?`;
+
+/**
+ * The pipeline jobs live in a pool, counted over the same live states as a person's (`?` the pool word),
+ * so the planner answers it from a partial index of the live rows and never scans the table. A pipeline job's account is the pipelines service
+ * account, or none, so the count does not name an account: the owner's cap is on NEMAR's pipelines in
+ * total per pool, whatever the recipe. The dispatchers read it (`pipelineRoom`) and the hold guards on it
+ * (`PIPELINE_LIVE_JOBS_GUARD_SQL`); one statement, so the room that is read and the room that is
+ * enforced cannot differ.
+ */
+export const PIPELINE_LIVE_JOBS_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
+   WHERE source = 'pipeline' AND pool = ? AND state IN (${LIVE_STATES_SQL})`;
+
+/**
+ * The pipelines' live cap, as a guard on the hold (plain `?` placeholders: the pool word, then the
+ * limit `policy.pipelines.maxLiveJobs[pool]`). Counted INSIDE the hold's own statement, so two requests
+ * racing for the last slot of a pool cannot both win; a refusal is `over_concurrency`.
+ */
+export const PIPELINE_LIVE_JOBS_GUARD_SQL = `(${PIPELINE_LIVE_JOBS_SQL}) < ?`;
 
 /** The hold row of a job exists: the one gate both of the batch's later statements wait behind. */
 const holdExists = (jobParam: number): string =>
@@ -690,10 +713,14 @@ export async function createJob(
   }
 
   const jobId = newJobId();
+  // The person's live-job limit, or for NEMAR's own pipelines the pipelines' live cap of this pool: the
+  // guard is in the hold's statement, and its refusal is read after the batch (`over_concurrency`).
   const guards: HoldGuard[] =
-    args.source !== "pipeline" && args.accountId !== null
-      ? [{ sql: LIVE_JOBS_GUARD_SQL, binds: [args.accountId, policy.maxLiveJobsPerPerson] }]
-      : [];
+    args.source === "pipeline"
+      ? [{ sql: PIPELINE_LIVE_JOBS_GUARD_SQL, binds: [word, policy.pipelines.maxLiveJobs[word]] }]
+      : args.accountId !== null
+        ? [{ sql: LIVE_JOBS_GUARD_SQL, binds: [args.accountId, policy.maxLiveJobsPerPerson] }]
+        : [];
   const hold = { poolId, budgetPoolId, amountMilli, jobId, extraGuards: guards };
 
   const statements = [...holdStatements(db, hold)];

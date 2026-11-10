@@ -5,6 +5,13 @@
  *                                         it has not been run over; `dry_run` says what it would do
  *   GET  /admin/compute/pipeline/status   the stamps, filtered, newest first, after they were synced
  *
+ * A run over the eligible datasets is bounded, for every actor, by its `limit`, the per-invocation bound
+ * (`COMPUTE_PIPELINE_RUN_PER_INVOCATION`), what is left of `pipelines.dailyJobCap` and what is left of the
+ * live cap of the recipe's pool (`dispatchEligible`); the answer's `room` says what was left and which of
+ * them bounded the run. One named dataset is bounded by the live cap (the hold refuses it as
+ * `over_concurrency`) and only counted by the daily cap (issue #2121). A dry run reports the same room and
+ * trims what it would dispatch to it.
+ *
  * The request names a recipe, then ONE dataset (with an optional version) or `eligible` with a `limit`,
  * and `dry_run`. It names nothing else: the dataset row (and with it eligibility, ADR 0065), the version
  * row, the service account, the pool and the runtime image are the Worker's own. A request with any other
@@ -77,7 +84,8 @@ const SENTENCES = {
   insufficient_balance: "The pipelines pool cannot cover the job.",
   platform_budget_exhausted: "The platform budget is exhausted.",
   suspended: "The pipelines pool is suspended.",
-  over_concurrency: "Too many jobs are running.",
+  over_concurrency: "NEMAR's pipelines already have as many live jobs as the owner allows.",
+  daily_cap_reached: "NEMAR's pipelines have already made as many jobs today as the owner allows.",
   invalid_spec: "The job could not be built from the recipe.",
   create_failed: "The job could not be created.",
   run_failed: "The run stopped on an unexpected error.",
@@ -329,6 +337,15 @@ export function registerComputePipelineAdminRoutes(admin: AdminRouter): void {
           results: run.results.map(resultView),
           dispatched: run.dispatched,
           stopped_by: run.stoppedBy,
+          ...(run.room === null
+            ? {}
+            : {
+                room: {
+                  daily_left: run.room.daily_left,
+                  live_left: run.room.live_left,
+                  limited_by: run.room.limited_by,
+                },
+              }),
           ...(audited ? {} : { audit_pending: true }),
         },
         run.dispatched > 0 ? 201 : 200,

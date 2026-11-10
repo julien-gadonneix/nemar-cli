@@ -17,9 +17,11 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { COMPUTE_RECIPES, findRecipe } from "../../shared/compute-recipes";
 import { DEFAULT_COMPUTE_POLICY } from "../../shared/contract/compute";
+import { COMPUTE_PIPELINE_RUN_PER_INVOCATION } from "../../shared/contract/compute-admin";
 import {
   CLAIM_STAMP_SQL,
   OPEN_STAMPS_SQL,
+  PIPELINE_JOBS_TODAY_SQL,
   dispatchPipelineJob,
 } from "../src/services/compute-pipeline";
 import {
@@ -208,6 +210,30 @@ describe("what it dispatches", () => {
     });
     await runComputePipelineDispatchCron({ ...env, DB: db });
     expect(opens).toBe(1);
+  });
+
+  test("a tick scans the day's count once (a full table scan), however many it dispatches", async () => {
+    const env = await world(ids(3));
+    let scans = 0;
+    const db = new Proxy(env.DB, {
+      get(target, prop) {
+        if (prop === "prepare") {
+          return (sql: string) => {
+            if (sql === PIPELINE_JOBS_TODAY_SQL) scans++;
+            return target.prepare(sql);
+          };
+        }
+        const value = Reflect.get(target, prop) as unknown;
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const result = await runComputePipelineDispatchCron({ ...env, DB: db });
+    expect(result).toMatchObject({ dispatched: 3, today: 0 });
+    expect(scans).toBe(1);
+  });
+
+  test("the tick's bound is the per-invocation bound of dispatchEligible, one number", () => {
+    expect(CRON_DISPATCH_PER_TICK).toBe(COMPUTE_PIPELINE_RUN_PER_INVOCATION);
   });
 
   test("a second run dispatches nothing: every dataset is stamped", async () => {

@@ -192,6 +192,7 @@ const VALID: Record<string, unknown> = {
     expires_in_minutes: 60,
   },
   ComputePipelineResultSchema: pipelineResult,
+  ComputePipelineRoomSchema: { daily_left: 4, live_left: 0, limited_by: "live_cap" },
   ComputePipelineStampViewSchema: pipelineStamp,
   ComputePipelineStatusResponseSchema: { stamps: [pipelineStamp], next_before: null },
   ComputePipelineRunResponseSchema: {
@@ -355,10 +356,33 @@ describe("compute-admin: every exported schema is open", () => {
     // `run_failed` is a word a run stops with, so it has a status, and not the 422 a missing one used to get.
     expect(table.run_failed).toBe(500);
     expect(table.registry_drift).toBe(409);
+    expect(table.daily_cap_reached).toBe(409);
     expect(table.version_not_found).toBe(404);
     expect(Object.keys(table).length).toBe(
       COMPUTE_REFUSAL_CODES.length + Object.keys(admin.COMPUTE_PIPELINE_ONLY_REFUSAL_STATUS).length,
     );
+  });
+
+  test("a run's room names what bounded it, from one list; the per-invocation bound is 10", () => {
+    expect([...admin.COMPUTE_PIPELINE_LIMITED_BY]).toEqual([
+      "limit",
+      "per_invocation",
+      "daily_cap",
+      "live_cap",
+    ]);
+    expect(admin.COMPUTE_PIPELINE_RUN_PER_INVOCATION).toBe(10);
+    const room = { daily_left: 4, live_left: 0, limited_by: "live_cap" };
+    const run = { ok: true, dry_run: false, recipe: "nemar-floor", room };
+    expect(admin.ComputePipelineRunResponseSchema.safeParse(run).success).toBe(true);
+    // A response without a room (a named dataset, an older Worker) still reads.
+    expect(
+      admin.ComputePipelineRunResponseSchema.safeParse({ ok: true, dry_run: true, recipe: "x" })
+        .success,
+    ).toBe(true);
+    expect(
+      admin.ComputePipelineRunResponseSchema.safeParse({ ...run, room: { daily_left: "4" } })
+        .success,
+    ).toBe(false);
   });
 
   test("the stamp states the CLI filters by are the registry's list, in its order", () => {
