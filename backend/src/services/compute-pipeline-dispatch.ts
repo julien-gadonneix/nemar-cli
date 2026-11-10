@@ -20,6 +20,9 @@
  *  - `policy.pipelines.maxLiveJobs` per pool, minus the pipeline jobs live in that pool, so a recipe never
  *    takes more of the cluster than the owner allows;
  *  - {@link CRON_DISPATCH_PER_TICK}, a bound of this file's own on one tick (below).
+ * Both reads are `pipelineRoom`, the one an administrator's run uses, and every pipeline hold also carries
+ * the live cap as a guard inside its own statement, so the cron and an administrator's run cannot together
+ * exceed it (issue #2121): what this file reads here decides what it TRIES, the hold decides what is made.
  * A refused hold stops the run for that pool: the next recipe of the same pool is not asked, because it
  * would be refused for the same reason. A refusal that would repeat for every pool (the switch off, no
  * image, no account) stops the run.
@@ -49,13 +52,14 @@
  */
 
 import { COMPUTE_RECIPES, type ComputeRecipe } from "../../../shared/compute-recipes.js";
-import { PARTITIONS, type PartitionName } from "../../../shared/contract/compute.js";
 import type { Bindings } from "../types/bindings.js";
-import { LIVE_STATES_SQL } from "./compute-jobs.js";
 import {
   type PipelineRefusal,
   type SyncResult,
   dispatchEligible,
+  pipelineJobsToday,
+  pipelineRoom,
+  poolOfRecipe,
   syncPipelineStamps,
 } from "./compute-pipeline.js";
 import { ComputePolicyUnreadable, getPolicy } from "./compute-policy.js";
@@ -110,24 +114,6 @@ const emptyResult = (outcome: PipelineCronResult["outcome"]): PipelineCronResult
   errors: [],
 });
 
-/** Pipeline jobs made today (UTC): `created_at` is `datetime('now')`, so a day starts at `date('now')`. */
-export const PIPELINE_JOBS_TODAY_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
-  WHERE source = 'pipeline' AND created_at >= date('now')`;
-
-/** Pipeline jobs live in a pool (`?1`). */
-export const PIPELINE_JOBS_LIVE_SQL = `SELECT COUNT(*) AS n FROM compute_jobs
-  WHERE source = 'pipeline' AND pool = ?1 AND state IN (${LIVE_STATES_SQL})`;
-
-const count = async (db: D1Database, sql: string, ...binds: unknown[]): Promise<number> =>
-  (
-    await db
-      .prepare(sql)
-      .bind(...binds)
-      .first<{ n: number }>()
-  )?.n ?? 0;
-
-const poolOf = (recipe: ComputeRecipe) => PARTITIONS[recipe.partition as PartitionName].pool;
-
 /**
  * One daily run. Null outside exact production, before anything is read or written. In production with
  * either switch off it returns `{ outcome: "off" }` and has touched nothing. Otherwise it syncs the
@@ -144,8 +130,7 @@ export async function runComputePipelineDispatchCron(
   try {
     result.synced = await syncPipelineStamps(env);
     const policy = (await getPolicy(db)).policy;
-    result.today = await count(db, PIPELINE_JOBS_TODAY_SQL);
-    let dailyLeft = Math.max(0, policy.pipelines.dailyJobCap - result.today);
+    result.today = await pipelineJobsToday(db);
     let tickLeft = CRON_DISPATCH_PER_TICK;
     const refusedPools = new Set<string>();
     let ended = false;
@@ -159,7 +144,7 @@ export async function runComputePipelineDispatchCron(
         stopped_by: null,
       };
       result.recipes.push(outcome);
-      const pool = poolOf(recipe);
+      const pool = poolOfRecipe(recipe);
       if (ended) {
         outcome.skipped = "run_ended";
         continue;
@@ -168,12 +153,13 @@ export async function runComputePipelineDispatchCron(
         outcome.skipped = "pool_refused";
         continue;
       }
+      // The one reading of both caps (`pipelineRoom`), shared with an administrator's run: what an
+      // administrator made today and what is live now count here as they count there.
+      const { daily_left: dailyLeft, live_left: liveLeft } = await pipelineRoom(db, policy, pool);
       if (dailyLeft <= 0) {
         outcome.skipped = "daily_cap";
         continue;
       }
-      const live = await count(db, PIPELINE_JOBS_LIVE_SQL, pool);
-      const liveLeft = Math.max(0, policy.pipelines.maxLiveJobs[pool] - live);
       if (liveLeft <= 0) {
         outcome.skipped = "live_cap";
         continue;
@@ -195,7 +181,6 @@ export async function runComputePipelineDispatchCron(
       outcome.dispatched = run.dispatched;
       outcome.stopped_by = run.stoppedBy;
       result.dispatched += run.dispatched;
-      dailyLeft -= run.dispatched;
       tickLeft -= run.dispatched;
       if (cutByTick && run.dispatched >= room && run.stoppedBy === null) {
         outcome.skipped = "tick_cap";

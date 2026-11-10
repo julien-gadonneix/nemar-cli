@@ -390,8 +390,37 @@ export type ComputeJobAdminResponse = z.infer<typeof ComputeJobAdminResponseSche
 
 // --- NEMAR's own pipelines (epic #2005 phase A6, #2011) ---------------------------------------------------
 
-/** The most datasets one `--eligible` run may dispatch: the policy's daily cap is the real ceiling. */
+/**
+ * The most datasets one `--eligible` request may ASK for. It is not what a run dispatches: a run is also
+ * bounded by the policy's live cap, the policy's daily cap and {@link COMPUTE_PIPELINE_RUN_PER_INVOCATION},
+ * whichever is smallest, and the answer's `room` says which one it was.
+ */
 export const COMPUTE_PIPELINE_RUN_LIMIT_MAX = 100;
+
+/**
+ * The most datasets ONE invocation dispatches, whoever asks and whatever the limit and the caps say. A
+ * Worker request cannot be trusted to carry 100 dispatches: one dispatch is about 25 subrequests (the
+ * dataset and version reads, the claim, the job's batch and records, the submit), so 100 are about 2,500
+ * against an allowance of about 1,000 per invocation in this project's older model (ADR 0118 records
+ * 10,000 for the compute crons and asks for a measurement; none has been taken for this route), and each
+ * one waits on the job platform in turn. Ten is also the daily dispatcher's own bound per tick; a run
+ * that wants more is asked again. Raising it needs a measurement first.
+ */
+export const COMPUTE_PIPELINE_RUN_PER_INVOCATION = 10;
+
+/**
+ * What bounded a run over the eligible datasets, the smallest of: the number asked for (`limit`), the
+ * per-invocation bound, what is left of the daily cap (`daily_cap`) and what is left of the live cap of
+ * the recipe's pool (`live_cap`). On a tie the first of these in this order is named.
+ */
+export const COMPUTE_PIPELINE_LIMITED_BY = [
+  "limit",
+  "per_invocation",
+  "daily_cap",
+  "live_cap",
+] as const;
+
+export type ComputePipelineLimitedBy = (typeof COMPUTE_PIPELINE_LIMITED_BY)[number];
 
 /** The default number of datasets an `--eligible` run takes when none is named. */
 export const COMPUTE_PIPELINE_RUN_LIMIT_DEFAULT = 10;
@@ -423,6 +452,8 @@ export interface ComputePipelineRunRequest {
  * `COMPUTE_REFUSAL_STATUS` gives it, so no status is declared twice.
  *  - `create_failed`: the job could not be written (502); `run_failed`: the run stopped on an
  *    unexpected error (500), a platform fault and not a refusal of the request.
+ *  - `daily_cap_reached`: NEMAR's pipelines have made as many jobs today as the owner allows (409). It
+ *    stops a run over the eligible datasets; a single named dataset is counted and never refused by it.
  */
 export const COMPUTE_PIPELINE_ONLY_REFUSAL_STATUS = {
   recipe_not_automatic: 422,
@@ -431,6 +462,7 @@ export const COMPUTE_PIPELINE_ONLY_REFUSAL_STATUS = {
   version_not_found: 404,
   version_untagged: 422,
   too_many_files: 422,
+  daily_cap_reached: 409,
   create_failed: 502,
   run_failed: 500,
 } as const;
@@ -468,6 +500,21 @@ export const ComputePipelineResultSchema = z
 export type ComputePipelineResult = z.infer<typeof ComputePipelineResultSchema>;
 
 /**
+ * The room a run over the eligible datasets had: what is left of the daily cap, what is left of the live
+ * cap of the recipe's pool, both read before the run, and what bounded the run (see
+ * {@link COMPUTE_PIPELINE_LIMITED_BY}). A dry run reports the same, so its preview matches a live run.
+ */
+export const ComputePipelineRoomSchema = z
+  .object({
+    daily_left: z.number().int(),
+    live_left: z.number().int(),
+    limited_by: z.string(),
+  })
+  .passthrough();
+
+export type ComputePipelineRoom = z.infer<typeof ComputePipelineRoomSchema>;
+
+/**
  * The answer of a pipeline run, live or dry. A live run has `results`, `dispatched` and `stopped_by`;
  * a dry run has the estimate, the config a real run needs, what would be dispatched and what blocks the
  * rest. Every field of the other kind is optional, so one schema reads both, and the response is open.
@@ -480,6 +527,8 @@ export const ComputePipelineRunResponseSchema = z
     results: z.array(ComputePipelineResultSchema).optional(),
     dispatched: z.number().int().optional(),
     stopped_by: z.string().nullable().optional(),
+    /** For a run over the eligible datasets, live or dry: the room it had and what bounded it. */
+    room: ComputePipelineRoomSchema.optional(),
     /** True when the run was made and the Worker could not write its audit row: nothing is lost but the row. */
     audit_pending: z.boolean().optional(),
     estimate_milli_per_job: milli.optional(),
