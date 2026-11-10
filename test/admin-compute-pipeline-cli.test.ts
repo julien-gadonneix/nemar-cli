@@ -40,6 +40,8 @@ import {
   seedEegDataset,
   seedPipelinesAccount,
 } from "../backend/test/helpers/compute-pipeline-fixture";
+import { setPolicy } from "../backend/test/helpers/compute-seed";
+import { DEFAULT_COMPUTE_POLICY } from "../shared/contract/compute";
 import {
   ComputePipelineRunResponseSchema,
   ComputePipelineStatusResponseSchema,
@@ -161,6 +163,58 @@ describe("run --eligible", () => {
     }
   });
 
+  test("its help says the run is bounded by the live cap, the daily cap and 10 per invocation", async () => {
+    const r = await runCli("admin", ["run", "--help-all"]);
+    expect(r.exitCode).toBe(0);
+    const text = r.stdout.replace(/\s+/g, " ");
+    for (const phrase of [
+      "bounded by the live cap of the pool, the daily cap and at most 10 per invocation",
+      "over_concurrency or daily_cap_reached",
+      "counts toward the daily cap and is not refused by it",
+    ]) {
+      expect(text).toContain(phrase);
+    }
+  });
+
+  test("a pool with room for 2 dispatches 2 of 5, stops by over_concurrency, and prints the room", async () => {
+    await setPolicy(fx.env().DB, fx.ownerId, {
+      pipelines: {
+        ...DEFAULT_COMPUTE_POLICY.pipelines,
+        maxLiveJobs: { cpu: 2, gpu: 4 },
+      },
+    });
+    const env = await world(["nm000104", "nm000105", "nm000106", "nm000107", "nm000108"]);
+    const r = await runCli("admin", ["run", "nemar-floor", "--eligible", "--limit", "5"]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("nemar-floor: dispatched 2 of 2 tried");
+    expect(r.stdout).toContain("stopped by over_concurrency");
+    expect(r.stdout).toContain(
+      "room before the run: 50 left of the daily cap, 2 left of the live cap; bounded by the live cap of the pool",
+    );
+    expect(await count(env, "compute_jobs")).toBe(2);
+    const again = await runCli("admin", ["run", "nemar-floor", "--eligible", "--limit", "5"]);
+    expect(again.exitCode).toBe(0);
+    expect(again.stdout).toContain("dispatched 0 of 0 tried");
+    expect(again.stdout).toContain("stopped by over_concurrency");
+    expect(await count(env, "compute_jobs")).toBe(2);
+  });
+
+  test("a named dataset on a full pool exits 1 with over_concurrency and its sentence", async () => {
+    await setPolicy(fx.env().DB, fx.ownerId, {
+      pipelines: { ...DEFAULT_COMPUTE_POLICY.pipelines, maxLiveJobs: { cpu: 1, gpu: 4 } },
+    });
+    await world();
+    expect((await runCli("admin", ["run", "nemar-floor", "--dataset", "nm000104"])).exitCode).toBe(
+      0,
+    );
+    const r = await runCli("admin", ["run", "nemar-floor", "--dataset", "nm000105"]);
+    expect(r.exitCode).toBe(1);
+    expect(r.stderr + r.stdout).toContain("over_concurrency");
+    expect(r.stderr + r.stdout).toContain(
+      "NEMAR's pipelines already have as many live jobs as the owner allows.",
+    );
+  });
+
   test("--eligible --limit 2 dispatches two of three and says which", async () => {
     const env = await world();
     const r = await runCli("admin", ["run", "nemar-floor", "--eligible", "--limit", "2"]);
@@ -257,6 +311,9 @@ describe("--dry-run", () => {
     expect(r.stdout).toContain("compute OFF, runtime image NOT SET, pipelines account present");
     expect(r.stdout).toContain("would dispatch 2:");
     expect(r.stdout).toContain("nm000104 v1.0.0");
+    expect(r.stdout).toContain(
+      "room now: 50 left of the daily cap, 8 left of the live cap; bounded by the limit asked for",
+    );
     expect([
       await count(env, "compute_pipeline_stamps"),
       await count(env, "compute_jobs"),
@@ -264,6 +321,28 @@ describe("--dry-run", () => {
       await count(env, "audit_log"),
       fx.tapis.log.length,
     ]).toEqual(before);
+  });
+
+  test("the queue's dry run is trimmed to 10 per invocation, and says so", async () => {
+    await setPolicy(fx.env().DB, fx.ownerId, {
+      pipelines: {
+        ...DEFAULT_COMPUTE_POLICY.pipelines,
+        dailyJobCap: 100,
+        maxLiveJobs: { cpu: 100, gpu: 4 },
+      },
+    });
+    await world(Array.from({ length: 12 }, (_, i) => `nm${String(104 + i).padStart(6, "0")}`));
+    const r = await runCli("admin", [
+      "run",
+      "nemar-floor",
+      "--eligible",
+      "--limit",
+      "100",
+      "--dry-run",
+    ]);
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout).toContain("would dispatch 10:");
+    expect(r.stdout).toContain("bounded by the bound of 10 per invocation, run it again for more");
   });
 
   test("for one dataset it says what blocks it", async () => {
