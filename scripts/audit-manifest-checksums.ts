@@ -1,22 +1,29 @@
 #!/usr/bin/env bun
 /**
  * Read-only audit of the public data plane (nemarOrg/nemar-cli#2118): every manifest entry whose
- * `sha256` value is not 64 lowercase hex digits, or whose `md5` is not 32, per dataset and version.
+ * checksum is not a digest of the shape its algorithm names (sha256 is 64 lowercase hex digits,
+ * md5 32, and the other git-annex backends their own length), per dataset and version.
  *
  * It only issues GET requests to the public data host (index at `/`, a dataset's versions at
  * `/<id>/`, each version's `manifest_url`). It writes nothing anywhere but standard output, and it
- * needs no credential. A manifest that answers 413 (too many files for `manifest.json`) is listed,
- * not read; any other non-200 answer is listed as unreadable.
+ * needs no credential.
+ *
+ * - Every fetched URL must have the same origin as `--base`; a `manifest_url` that points
+ *   elsewhere is refused and reported, and a redirect is never followed.
+ * - Every request has a timeout and a bounded retry with backoff on 429, 5xx and network errors.
+ * - A manifest that answers 413 (too many files for `manifest.json`) is listed, not read.
+ * - A failed fetch never aborts the run: it is listed as unreadable and the report is printed.
+ *
+ * Exit status: 0 when every manifest was read (or answered 413) and none has a finding; 1 when
+ * there is a finding, an unreadable version or a refused URL (`--no-fail` always exits 0, for
+ * report-only use); 2 for a usage error or an unreadable index.
  *
  * Usage:
  *   bun scripts/audit-manifest-checksums.ts [--base https://data.nemar.org] [--concurrency 6]
- *                                           [--only <dataset id>[,<id>...]] [--json]
+ *     [--only <dataset id>[,<id>...]] [--timeout-ms 30000] [--retries 3] [--json] [--no-fail]
  */
 
-const SHAPE: Readonly<Record<string, { length: number; label: string }>> = {
-  sha256: { length: 64, label: "64 lowercase hex" },
-  md5: { length: 32, label: "32 lowercase hex" },
-};
+import { isWellFormedChecksum } from "../backend/src/services/manifest";
 
 export interface ManifestRow {
   path?: unknown;
@@ -34,15 +41,16 @@ export interface VersionFinding {
   examples: Array<{ path: string; algorithm: string; length: number }>;
 }
 
-/** True when the value is a digest of the shape its algorithm names. Other algorithms are not judged. */
+/**
+ * True when the value is a digest of the shape its algorithm names, by the one rule the data plane
+ * itself applies (`isWellFormedChecksum`). An algorithm with no known length (`git`, ...) passes.
+ */
 export function checksumIsWellFormed(algorithm: unknown, value: unknown): boolean {
   if (typeof algorithm !== "string") return true;
-  const shape = SHAPE[algorithm];
-  if (!shape) return true;
-  return typeof value === "string" && value.length === shape.length && /^[0-9a-f]+$/.test(value);
+  return typeof value === "string" && isWellFormedChecksum(algorithm, value);
 }
 
-/** Classify one manifest's rows. Never throws on a malformed row; a non-object row counts as bad. */
+/** Classify one manifest's rows. Never throws on a malformed row. */
 export function auditEntries(
   dataset: string,
   version: string,
@@ -72,33 +80,81 @@ export function auditEntries(
   return finding;
 }
 
-interface Options {
+export interface AuditOptions {
   base: string;
   concurrency: number;
   only: Set<string> | null;
-  json: boolean;
+  timeoutMs: number;
+  retries: number;
+  /** First backoff in milliseconds; doubles per retry. */
+  backoffMs: number;
 }
 
-function parseArgs(argv: string[]): Options {
-  const opts: Options = { base: "https://data.nemar.org", concurrency: 6, only: null, json: false };
-  for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === "--base") opts.base = (argv[++i] ?? "").replace(/\/+$/, "");
-    else if (a === "--concurrency") opts.concurrency = Math.max(1, Number(argv[++i]) || 6);
-    else if (a === "--only") opts.only = new Set((argv[++i] ?? "").split(",").filter(Boolean));
-    else if (a === "--json") opts.json = true;
-    else throw new Error(`unknown argument ${a}`);
-  }
-  return opts;
+export interface AuditReport {
+  base: string;
+  datasets: number;
+  versionsListed: number;
+  manifestsRead: number;
+  findings: VersionFinding[];
+  /** `<dataset>@<version>` whose manifest answered 413. */
+  tooLarge: string[];
+  /** Fetches that failed after their retries, with the reason. */
+  unreadable: string[];
+  /** URLs refused because their origin is not the base's. */
+  refused: string[];
+  /** Set when the index itself could not be read; nothing else was audited. */
+  indexError: string | null;
 }
 
-async function getJson(url: string): Promise<{ status: number; body: unknown }> {
-  const res = await fetch(url, { headers: { Accept: "application/json" } });
-  if (res.status !== 200) {
-    await res.body?.cancel();
-    return { status: res.status, body: null };
+export const DEFAULT_OPTIONS: AuditOptions = {
+  base: "https://data.nemar.org",
+  concurrency: 6,
+  only: null,
+  timeoutMs: 30_000,
+  retries: 3,
+  backoffMs: 500,
+};
+
+class RefusedOriginError extends Error {}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * GET one JSON document. Retries 429, 5xx and network errors with doubling backoff, up to
+ * `retries` extra attempts; any other status is returned as it is. Throws `RefusedOriginError`
+ * for a URL outside the base's origin and an `Error` once the attempts are used up.
+ */
+async function getJson(
+  url: string,
+  opts: AuditOptions,
+): Promise<{ status: number; body: unknown }> {
+  if (new URL(url).origin !== new URL(opts.base).origin) {
+    throw new RefusedOriginError(`${url} is not on the origin of ${opts.base}`);
   }
-  return { status: 200, body: await res.json() };
+  let lastError = "";
+  for (let attempt = 0; attempt <= opts.retries; attempt++) {
+    if (attempt > 0) await sleep(opts.backoffMs * 2 ** (attempt - 1));
+    try {
+      const res = await fetch(url, {
+        headers: { Accept: "application/json" },
+        redirect: "manual",
+        signal: AbortSignal.timeout(opts.timeoutMs),
+      });
+      if (res.status === 429 || res.status >= 500) {
+        await res.body?.cancel();
+        lastError = `HTTP ${res.status}`;
+        continue;
+      }
+      if (res.status !== 200) {
+        await res.body?.cancel();
+        return { status: res.status, body: null };
+      }
+      return { status: 200, body: await res.json() };
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err);
+    }
+  }
+  throw new Error(`${lastError} after ${opts.retries + 1} attempts`);
 }
 
 /** Run `fn` over `items` with at most `limit` in flight. */
@@ -110,100 +166,166 @@ async function pool<T>(items: T[], limit: number, fn: (item: T) => Promise<void>
   await Promise.all(workers);
 }
 
-async function main(): Promise<void> {
-  const opts = parseArgs(process.argv.slice(2));
-  const index = await getJson(`${opts.base}/`);
-  if (index.status !== 200) throw new Error(`index answered HTTP ${index.status}`);
-  const datasets = (index.body as { datasets: Array<{ id: string }> }).datasets
-    .map((d) => d.id)
-    .filter((id) => !opts.only || opts.only.has(id));
+/** Audit every published manifest reachable from the base. Never throws for a fetch failure. */
+export async function runAudit(options: Partial<AuditOptions> = {}): Promise<AuditReport> {
+  const opts: AuditOptions = { ...DEFAULT_OPTIONS, ...options };
+  const base = opts.base.replace(/\/+$/, "");
+  opts.base = base;
+  const report: AuditReport = {
+    base,
+    datasets: 0,
+    versionsListed: 0,
+    manifestsRead: 0,
+    findings: [],
+    tooLarge: [],
+    unreadable: [],
+    refused: [],
+    indexError: null,
+  };
+
+  let ids: string[];
+  try {
+    const index = await getJson(`${base}/`, opts);
+    if (index.status !== 200) throw new Error(`HTTP ${index.status}`);
+    const list = (index.body as { datasets?: Array<{ id?: unknown }> } | null)?.datasets;
+    if (!Array.isArray(list)) throw new Error("the index has no datasets list");
+    ids = list
+      .map((d) => d.id)
+      .filter((id): id is string => typeof id === "string" && id.length > 0)
+      .filter((id) => !opts.only || opts.only.has(id));
+  } catch (err) {
+    report.indexError = err instanceof Error ? err.message : String(err);
+    return report;
+  }
+  report.datasets = ids.length;
 
   const jobs: Array<{ dataset: string; version: string; url: string }> = [];
-  const unreadable: string[] = [];
-  await pool(datasets, opts.concurrency, async (dataset) => {
-    const res = await getJson(`${opts.base}/${dataset}/`);
-    if (res.status !== 200) {
-      unreadable.push(`${dataset} (version list HTTP ${res.status})`);
-      return;
-    }
-    const versions = (res.body as { versions?: Array<{ version: string; manifest_url?: string }> })
-      .versions;
-    for (const v of versions ?? []) {
-      if (!v.manifest_url) continue;
-      jobs.push({
-        dataset,
-        version: v.version,
-        url: new URL(v.manifest_url, `${opts.base}/`).href,
-      });
+  await pool(ids, opts.concurrency, async (dataset) => {
+    try {
+      const res = await getJson(`${base}/${encodeURIComponent(dataset)}/`, opts);
+      if (res.status !== 200) {
+        report.unreadable.push(`${dataset} (version list HTTP ${res.status})`);
+        return;
+      }
+      const versions = (res.body as { versions?: unknown } | null)?.versions;
+      if (!Array.isArray(versions)) {
+        report.unreadable.push(`${dataset} (version list has no versions array)`);
+        return;
+      }
+      for (const v of versions as Array<{ version?: unknown; manifest_url?: unknown }>) {
+        if (typeof v.version !== "string" || typeof v.manifest_url !== "string") continue;
+        const url = new URL(v.manifest_url, `${base}/`).href;
+        if (new URL(url).origin !== new URL(base).origin) {
+          report.refused.push(`${dataset}@${v.version} (${url})`);
+          continue;
+        }
+        jobs.push({ dataset, version: v.version, url });
+      }
+    } catch (err) {
+      report.unreadable.push(`${dataset} (version list: ${(err as Error).message})`);
     }
   });
+  report.versionsListed = jobs.length + report.refused.length;
 
-  const findings: VersionFinding[] = [];
-  const tooLarge: string[] = [];
-  let read = 0;
   await pool(jobs, opts.concurrency, async (job) => {
-    let res: { status: number; body: unknown };
+    const label = `${job.dataset}@${job.version}`;
     try {
-      res = await getJson(job.url);
+      const res = await getJson(job.url, opts);
+      if (res.status === 413) {
+        report.tooLarge.push(label);
+      } else if (res.status !== 200 || !Array.isArray(res.body)) {
+        report.unreadable.push(`${label} (HTTP ${res.status})`);
+      } else {
+        report.manifestsRead++;
+        const finding = auditEntries(job.dataset, job.version, res.body);
+        if (finding.bad > 0) report.findings.push(finding);
+      }
     } catch (err) {
-      unreadable.push(`${job.dataset}@${job.version} (${(err as Error).message})`);
-      return;
+      report.unreadable.push(`${label} (${(err as Error).message})`);
     }
-    if (res.status === 413) {
-      tooLarge.push(`${job.dataset}@${job.version}`);
-      return;
-    }
-    if (res.status !== 200 || !Array.isArray(res.body)) {
-      unreadable.push(`${job.dataset}@${job.version} (HTTP ${res.status})`);
-      return;
-    }
-    read++;
-    const finding = auditEntries(job.dataset, job.version, res.body);
-    if (finding.bad > 0) findings.push(finding);
   });
 
   const key = (f: { dataset: string; version: string }) => `${f.dataset}@${f.version}`;
-  findings.sort((a, b) => (key(a) < key(b) ? -1 : 1));
-  tooLarge.sort();
-  unreadable.sort();
+  report.findings.sort((a, b) => (key(a) < key(b) ? -1 : 1));
+  report.tooLarge.sort();
+  report.unreadable.sort();
+  report.refused.sort();
+  return report;
+}
 
-  if (opts.json) {
-    console.log(
-      JSON.stringify(
-        {
-          base: opts.base,
-          datasets: datasets.length,
-          manifests_read: read,
-          findings,
-          tooLarge,
-          unreadable,
-        },
-        null,
-        2,
-      ),
-    );
-    return;
+/** 0 clean, 1 findings or unreadable or refused, 2 unreadable index; `noFail` forces 0 except 2. */
+export function exitCodeFor(report: AuditReport, noFail: boolean): number {
+  if (report.indexError !== null) return 2;
+  if (noFail) return 0;
+  return report.findings.length > 0 || report.unreadable.length > 0 || report.refused.length > 0
+    ? 1
+    : 0;
+}
+
+export function formatReport(report: AuditReport): string {
+  const lines: string[] = [];
+  if (report.indexError !== null) {
+    lines.push(`base ${report.base}: the index could not be read (${report.indexError})`);
+    return lines.join("\n");
   }
-  console.log(
-    `base ${opts.base}: ${datasets.length} datasets, ${jobs.length} versions listed, ${read} manifests read`,
+  lines.push(
+    `base ${report.base}: ${report.datasets} datasets, ${report.versionsListed} versions listed, ${report.manifestsRead} manifests read`,
   );
-  console.log(`rule: sha256 = ${SHAPE.sha256.label}, md5 = ${SHAPE.md5.label}`);
-  console.log(`\nversions with a wrong-shaped checksum: ${findings.length}`);
-  for (const f of findings) {
+  lines.push("rule: sha256 = 64 lowercase hex, md5 = 32, other annex backends their own length");
+  lines.push(`\nversions with a wrong-shaped checksum: ${report.findings.length}`);
+  for (const f of report.findings) {
     const shapes = Object.entries(f.shapes)
       .map(([s, n]) => `${s} x${n}`)
       .join(", ");
-    console.log(`  ${key(f)}: ${f.bad} of ${f.entries} entries (${shapes})`);
+    lines.push(`  ${f.dataset}@${f.version}: ${f.bad} of ${f.entries} entries (${shapes})`);
     for (const e of f.examples)
-      console.log(`    e.g. ${e.path} (${e.algorithm}, length ${e.length})`);
+      lines.push(`    e.g. ${e.path} (${e.algorithm}, length ${e.length})`);
   }
-  console.log(`\nanswered 413, not read (${tooLarge.length}): ${tooLarge.join(", ") || "none"}`);
-  console.log(`unreadable (${unreadable.length}): ${unreadable.join(", ") || "none"}`);
+  lines.push(
+    `\nanswered 413, not read (${report.tooLarge.length}): ${report.tooLarge.join(", ") || "none"}`,
+  );
+  lines.push(`unreadable (${report.unreadable.length}): ${report.unreadable.join("; ") || "none"}`);
+  lines.push(
+    `refused, other origin (${report.refused.length}): ${report.refused.join("; ") || "none"}`,
+  );
+  return lines.join("\n");
+}
+
+function parseArgs(argv: string[]): {
+  opts: Partial<AuditOptions>;
+  json: boolean;
+  noFail: boolean;
+} {
+  const opts: Partial<AuditOptions> = {};
+  let json = false;
+  let noFail = false;
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === "--base") opts.base = argv[++i] ?? "";
+    else if (a === "--concurrency") opts.concurrency = Math.max(1, Number(argv[++i]) || 6);
+    else if (a === "--timeout-ms") opts.timeoutMs = Math.max(1, Number(argv[++i]) || 30_000);
+    else if (a === "--retries") opts.retries = Math.max(0, Number(argv[++i]) || 0);
+    else if (a === "--only") opts.only = new Set((argv[++i] ?? "").split(",").filter(Boolean));
+    else if (a === "--json") json = true;
+    else if (a === "--no-fail") noFail = true;
+    else throw new Error(`unknown argument ${a}`);
+  }
+  return { opts, json, noFail };
+}
+
+async function main(): Promise<number> {
+  let parsed: ReturnType<typeof parseArgs>;
+  try {
+    parsed = parseArgs(process.argv.slice(2));
+  } catch (err) {
+    console.error(err instanceof Error ? err.message : err);
+    return 2;
+  }
+  const report = await runAudit(parsed.opts);
+  console.log(parsed.json ? JSON.stringify(report, null, 2) : formatReport(report));
+  return exitCodeFor(report, parsed.noFail);
 }
 
 if (import.meta.main) {
-  main().catch((err) => {
-    console.error(err instanceof Error ? err.message : err);
-    process.exit(1);
-  });
+  process.exit(await main());
 }
