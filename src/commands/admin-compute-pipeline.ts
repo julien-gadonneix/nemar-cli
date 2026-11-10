@@ -7,7 +7,9 @@
  *   nemar admin compute pipeline status [--recipe <name>] [--dataset <id>] [--state <state>] [--limit <n>]
  *
  * A run names a recipe and then ONE dataset (with an optional version) or the queue of eligible datasets
- * with a limit. It names nothing else: the dataset row (and with it eligibility), the version row, the
+ * with a limit. Every run, whoever asks, is bounded by the owner's live and daily caps and by
+ * `COMPUTE_PIPELINE_RUN_PER_INVOCATION` per invocation (issue #2121); the answer's `room` says which
+ * one it was. It names nothing else: the dataset row (and with it eligibility), the version row, the
  * service account, the pool and the runtime image are the Worker's. `--dry-run` reads only and works against
  * every Worker, including a development one with compute off. A live run is refused by the Worker unless
  * compute is switched on. Every command takes `--json` (standard output stays pure JSON) and exits 1 on any
@@ -18,9 +20,11 @@ import { Command } from "commander";
 import {
   COMPUTE_PIPELINE_RUN_LIMIT_DEFAULT,
   COMPUTE_PIPELINE_RUN_LIMIT_MAX,
+  COMPUTE_PIPELINE_RUN_PER_INVOCATION,
   COMPUTE_PIPELINE_STAMP_STATES,
   COMPUTE_PIPELINE_STATUS_PAGE_MAX,
   type ComputePipelineResult,
+  type ComputePipelineRoom,
   type ComputePipelineRunRequest,
   type ComputePipelineRunResponse,
   type ComputePipelineStampView,
@@ -58,6 +62,19 @@ function resultLine(r: ComputePipelineResult): string {
   return `  ${word(r.dataset_id)}${r.version ? ` ${word(r.version)}` : ""}: refused, ${word(r.code ?? "?")}${blocked}`;
 }
 
+/** What a run had room for, and what bounded it, in words a person reads (the fixed words are the Worker's). */
+const LIMITED_BY_TEXT: Record<string, string> = {
+  limit: "the limit asked for",
+  per_invocation: `the bound of ${COMPUTE_PIPELINE_RUN_PER_INVOCATION} per invocation, run it again for more`,
+  daily_cap: "the daily cap",
+  live_cap: "the live cap of the pool",
+};
+
+function roomLine(room: ComputePipelineRoom, when: string): string {
+  const by = LIMITED_BY_TEXT[room.limited_by] ?? word(room.limited_by);
+  return `  room ${when}: ${room.daily_left} left of the daily cap, ${room.live_left} left of the live cap; bounded by ${by}`;
+}
+
 function printRun(res: ComputePipelineRunResponse): void {
   if (res.dry_run) {
     say(`dry run of ${word(res.recipe)}: nothing was written`);
@@ -75,6 +92,7 @@ function printRun(res: ComputePipelineRunResponse): void {
           `pipelines account ${c.pipelines_account ? "present" : "MISSING"}`,
       );
     }
+    if (res.room) say(roomLine(res.room, "now"));
     const would = res.would_dispatch ?? [];
     say(`  would dispatch ${would.length}:`);
     for (const d of would) say(`    ${word(d.dataset_id)} ${word(d.version)}`);
@@ -97,6 +115,7 @@ function printRun(res: ComputePipelineRunResponse): void {
   say(`${word(res.recipe)}: dispatched ${res.dispatched ?? 0} of ${results.length} tried`);
   for (const r of results) say(resultLine(r));
   if (res.stopped_by) say(`  stopped by ${word(res.stopped_by)}`);
+  if (res.room) say(roomLine(res.room, "before the run"));
 }
 
 function stampLine(s: ComputePipelineStampView): string {
@@ -149,9 +168,15 @@ Runs a processing recipe on NEMAR's own datasets through the compute gateway, or
   <recipe>                  a recipe of the Worker's registry, such as nemar-floor
   --dataset <id>[@version]  one dataset; the newest version when none is given
   --eligible [--limit <n>]  the next <n> eligible datasets the recipe has not been run over (default
-                            ${COMPUTE_PIPELINE_RUN_LIMIT_DEFAULT}, at most ${COMPUTE_PIPELINE_RUN_LIMIT_MAX})
+                            ${COMPUTE_PIPELINE_RUN_LIMIT_DEFAULT}, at most ${COMPUTE_PIPELINE_RUN_LIMIT_MAX}); a run is also
+                            bounded by the live cap of the pool, the daily cap and at most
+                            ${COMPUTE_PIPELINE_RUN_PER_INVOCATION} per invocation, and says which one bounded it
   --dry-run                 read only: the datasets it would run, the estimated SU, what a real run
                             lacks, and what blocks the rest; works against every Worker
+
+The caps are the owner's, for every path: a run that finds the pool full or the day's cap used stops
+with over_concurrency or daily_cap_reached and dispatches nothing. One named dataset is refused as
+over_concurrency when the pool is full; it counts toward the daily cap and is not refused by it.
 
 Only a public, non-anonymous, first-published, non-withdrawn dataset with EEG data and at least one
 version is eligible; the Worker decides that from its own record, never from this command. A dataset
