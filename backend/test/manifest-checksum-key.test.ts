@@ -4,10 +4,11 @@
  * (`...cc31C`, `...789701`).
  *
  * The keys below are the real ones read from nemarDatasets/on003104 at v1.0.0.
- * git-annex keeps the whole tail of a name that has no dot as its "extension"
- * and appends it to the digest with no separator, so the greedy hex match in
- * `extractChecksumFromKey` took the leading hex digits of `COR-001` (`C`) and
- * `01_brain_surface` (`01`) as part of the digest.
+ * They were written upstream (OpenNeuro tooling), not by git-annex, with the tail
+ * of a dotless file name straight after the digest (git-annex itself writes the
+ * bare digest for those files and refuses the tail form on verification), so the
+ * greedy hex match in `extractChecksumFromKey` took the leading hex digits of
+ * `COR-001` (`C`) and `01_brain_surface` (`01`) as part of the digest.
  *
  * Two layers are covered: the key parser, and the real `dataRoutes` app serving
  * `manifest.json` from a stored manifest that already holds the wrong values
@@ -18,7 +19,7 @@
 import type { Database } from "bun:sqlite";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
@@ -160,10 +161,49 @@ describe("extractChecksumFromKey on real annex key shapes", () => {
     }
   });
 
+  test("a backend named like an Object.prototype property is unknown, not a table hit", () => {
+    // `constructor` and `__proto__` used to be found on the prototype of the lookup table:
+    // `identifyAnnexBackend` returned a function as the length and generateManifest threw.
+    expect(identifyAnnexBackend("CONSTRUCTOR-s1--abc.edf")).toBeNull();
+    expect(extractHashAlgorithm("CONSTRUCTOR-s1--abc.edf")).toBe("constructor");
+    expect(extractChecksumFromKey("CONSTRUCTOR-s1--abc.edf")).toBe("abc");
+    expect(identifyAnnexBackend("__PROTO__-s1--abc.edf")).toBeNull();
+    expect(extractHashAlgorithm("__PROTO__-s1--abc.edf")).toBe("sha256");
+    expect(extractChecksumFromKey("__PROTO__-s1--abc.edf")).toBe("abc");
+    expect(isWellFormedChecksum("constructor", "abc")).toBe(true);
+    expect(isWellFormedChecksum("__proto__", "abc")).toBe(true);
+    expect(isWellFormedChecksum("toString", "abc")).toBe(true);
+  });
+
   test("no digest at all", () => {
     expect(extractChecksumFromKey("git:abcd")).toBe("");
     expect(extractChecksumFromKey("")).toBe("");
   });
+});
+
+/**
+ * `fixtures/annex-key-vectors.json` is shared byte for byte with the central manifest generator's own
+ * test (`emit_manifest.py` in the dataset organization's `.github` repository), which has the same
+ * parse. A live parity pin against the central copy is a follow-up that can land only after the
+ * central change merges; until then the two copies are kept identical by hand.
+ */
+describe("the shared annex key vectors", () => {
+  const vectors = (
+    JSON.parse(readFileSync(join(import.meta.dir, "fixtures/annex-key-vectors.json"), "utf8")) as {
+      vectors: Array<{ key: string; algorithm: string; digest: string; why: string }>;
+    }
+  ).vectors;
+
+  test("the file holds the 26 vectors", () => {
+    expect(vectors.length).toBe(26);
+  });
+
+  for (const v of vectors) {
+    test(`${v.why}: ${v.key.slice(0, 40)}`, () => {
+      expect(extractHashAlgorithm(v.key)).toBe(v.algorithm);
+      expect(extractChecksumFromKey(v.key)).toBe(v.digest);
+    });
+  }
 });
 
 describe("isWellFormedChecksum", () => {

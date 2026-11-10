@@ -66,12 +66,15 @@ export function extractSizeFromKey(key: string): number {
  * `git annex version` lists, `E` and non-`E` alike; the backends left out
  * (`WORM`, `URL`, `VURL`, `GITBUNDLE`, `GITMANIFEST`, `X*`) are not content digests.
  *
- * Why the length matters: a `...E` backend appends the file's extension to the
- * digest, and git-annex keeps the whole tail of a name that has no dot, so a
- * hex-looking extension runs straight into the digest:
- * `SHA256E-s65536--<64 hex>COR-001` for `COR-001`,
+ * Why the length matters: some published datasets carry keys that were written
+ * upstream (OpenNeuro tooling), not by git-annex, with the tail of a dotless file
+ * name straight after the digest: `SHA256E-s65536--<64 hex>COR-001` for `COR-001`,
  * `SHA256E-s369273--<64 hex>01_brain_surface` for `01_brain_surface`
- * (nemarOrg/nemar-cli#2118). The length is the only thing that tells them apart.
+ * (nemarOrg/nemar-cli#2118). git-annex itself writes no such tail for those files
+ * (`SHA256E-s65536--<64 hex>`) and refuses the tail form on verification, but the
+ * manifest must still read the key as it is. A tail that starts with hex characters
+ * (`C`, `01`) runs into the digest, and the length is the only thing that tells
+ * them apart.
  */
 export const ANNEX_DIGEST_HEX_LENGTH: Readonly<Record<string, number>> = {
   md5: 32,
@@ -99,6 +102,11 @@ export const ANNEX_DIGEST_HEX_LENGTH: Readonly<Record<string, number>> = {
   blake2sp256: 64,
 };
 
+/** The table's length for a lowercase backend name, own properties only. */
+function digestLengthOf(name: string): number | undefined {
+  return Object.hasOwn(ANNEX_DIGEST_HEX_LENGTH, name) ? ANNEX_DIGEST_HEX_LENGTH[name] : undefined;
+}
+
 /** A backend positively identified from an annex key. */
 export interface AnnexBackend {
   /** The backend as written in the key (`SHA256E`, `MD5`). */
@@ -121,7 +129,9 @@ export function identifyAnnexBackend(key: string): AnnexBackend | null {
   const match = key.match(/^([A-Z0-9_]+?)(E?)(?:-s\d+)?(?:-[A-Za-z]\d+)*--/);
   if (!match) return null;
   const name = match[1].toLowerCase();
-  const length = ANNEX_DIGEST_HEX_LENGTH[name];
+  // Own properties only: a backend named `constructor` or `__proto__` must not find
+  // something on the object prototype.
+  const length = digestLengthOf(name);
   if (length === undefined) return null;
   return { backend: `${match[1]}${match[2]}`, name, length };
 }
@@ -162,7 +172,7 @@ export function extractChecksumFromKey(key: string): string {
  * else) is not judged and counts as well formed.
  */
 export function isWellFormedChecksum(algorithm: string, value: string): boolean {
-  const length = ANNEX_DIGEST_HEX_LENGTH[algorithm];
+  const length = digestLengthOf(algorithm);
   if (length === undefined) return true;
   return value.length === length && /^[0-9a-f]+$/.test(value);
 }
@@ -201,34 +211,6 @@ export function repairStoredChecksum(
     }
   }
   return { value, status: "malformed" };
-}
-
-/** One annex entry whose digest has the wrong length for its identified backend. */
-export interface MalformedChecksumEntry {
-  path: string;
-  backend: string;
-}
-
-/**
- * Raised when a manifest under construction holds a key of a positively
- * identified backend whose digest does not have that backend's length, which is
- * corruption and not a parsing guess. Names the dataset, the version and up to
- * three paths with their backend, never a checksum value.
- */
-export class MalformedChecksumError extends Error {
-  constructor(
-    public readonly datasetId: string,
-    public readonly version: string,
-    public readonly count: number,
-    public readonly examples: readonly MalformedChecksumEntry[],
-  ) {
-    super(
-      `dataset ${datasetId} version ${version}: ${count} annex key(s) have a digest of the wrong length for their backend (for example ${examples
-        .map((e) => `${e.path} [${e.backend}]`)
-        .join(", ")})`,
-    );
-    this.name = "MalformedChecksumError";
-  }
 }
 
 /**
@@ -288,7 +270,7 @@ export async function generateManifest(
   );
 
   const files: Record<string, ManifestFile> = {};
-  const malformedChecksums: MalformedChecksumEntry[] = [];
+  const malformedChecksums: Array<{ path: string; backend: string }> = [];
   // Pointer candidates whose `parseAnnexPointer` returned null — they're
   // small regular git files (README, CHANGES, dataset_description.json on
   // OpenNeuro mirrors are commonly <500 bytes), NOT annex pointers. They
@@ -313,8 +295,8 @@ export async function generateManifest(
       if (key) {
         const algorithm = extractHashAlgorithm(key);
         const digest = extractChecksumFromKey(key);
-        // Refuse only a positively identified backend with a wrong-length digest; a key
-        // this parser does not recognize is carried as before and never judged.
+        // Report (never refuse) a positively identified backend with a wrong-length digest;
+        // a key this parser does not recognize is carried as before and never judged.
         const backend = identifyAnnexBackend(key);
         if (backend && !isWellFormedChecksum(algorithm, digest)) {
           malformedChecksums.push({ path: entry.path, backend: backend.backend });
@@ -330,12 +312,16 @@ export async function generateManifest(
     }
   }
 
+  // Every caller runs after the version's DOI is minted, so a manifest is never refused over
+  // a digest: it is carried as found and reported once per build, as the data route does when
+  // it serves a stored one. No checksum value is logged.
   if (malformedChecksums.length > 0) {
-    throw new MalformedChecksumError(
-      datasetId,
-      version,
-      malformedChecksums.length,
-      malformedChecksums.slice(0, 3),
+    const examples = malformedChecksums
+      .slice(0, 3)
+      .map((e) => `${e.path} [${e.backend}]`)
+      .join(", ");
+    console.warn(
+      `[manifest] MALFORMED CHECKSUM dataset=${datasetId} version=${version} count=${malformedChecksums.length} examples=${examples}`,
     );
   }
 

@@ -40,7 +40,6 @@ const fakeTree: Array<{
 const fakeBlobs: Record<string, string> = {};
 
 let generateManifest: typeof import("../src/services/manifest").generateManifest;
-let MalformedChecksumError: typeof import("../src/services/manifest").MalformedChecksumError;
 
 /** Full-length digests: the builder refuses a key whose digest is not one (#2118). */
 const X_DIGEST = "abc123def4567890abc123def4567890abc123def4567890abc123def4567890";
@@ -64,7 +63,7 @@ describe.skipIf(!ISOLATED)("generateManifest — small root file handling (issue
       getTreeAtRef: async () => fakeTree,
       getBlobContent: async (_repo: string, sha: string) => fakeBlobs[sha] ?? "",
     }));
-    ({ generateManifest, MalformedChecksumError } = await import("../src/services/manifest"));
+    ({ generateManifest } = await import("../src/services/manifest"));
   });
 
   beforeEach(() => {
@@ -168,7 +167,8 @@ describe.skipIf(!ISOLATED)("generateManifest — small root file handling (issue
 
   // nemarOrg/nemar-cli#2118. The keys are the real ones of nemarDatasets/on003104 at v1.0.0,
   // read through the GitHub contents API: a locked-mode symlink target whose file name has no
-  // dot, so git-annex keeps the whole name as the "extension" and it runs into the digest.
+  // dot. The key was written upstream with the name's tail after the digest (git-annex itself
+  // writes the bare digest for such a file), and the tail runs into the digest.
   // `C` (from COR-001) and `01` (from 01_brain_surface) are hex digits, which is why the old
   // parse took them for part of a 64-character digest.
   test("a name with no dot, whose tail starts with hex digits, does not leak into the digest (#2118)", async () => {
@@ -204,22 +204,31 @@ describe.skipIf(!ISOLATED)("generateManifest — small root file handling (issue
     });
   });
 
-  test("a key whose digest is not a digest is refused, naming the path (#2118)", async () => {
+  test("a key whose digest has the wrong length is carried and reported once, never refused (#2118)", async () => {
     blob("sub-1/eeg/short.edf", "sha-short", 200, "/annex/objects/SHA256E-s10--abc123.edf");
     blob("sub-1/eeg/ok.edf", "sha-ok", 200, `/annex/objects/SHA256E-s10--${X_DIGEST}.edf`);
 
-    const err = await generateManifest("test/repo", "v1.0.0", "fake-pat", "test", null, null, {
-      skipGitBackedVerification: true,
-    }).catch((e: unknown) => e);
+    const warned: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...args: unknown[]) => {
+      warned.push(args.map(String).join(" "));
+    };
+    let m: Awaited<ReturnType<typeof generateManifest>>;
+    try {
+      m = await generateManifest("test/repo", "v1.0.0", "fake-pat", "test", null, null, {
+        skipGitBackedVerification: true,
+      });
+    } finally {
+      console.warn = realWarn;
+    }
 
-    expect(err).toBeInstanceOf(MalformedChecksumError);
-    const refusal = err as InstanceType<typeof MalformedChecksumError>;
-    expect(refusal.count).toBe(1);
-    expect(refusal.examples).toEqual([{ path: "sub-1/eeg/short.edf", backend: "SHA256E" }]);
-    // The message names the dataset, version, path and backend, and no checksum value.
-    expect(refusal.message).toContain("dataset test version v1.0.0");
-    expect(refusal.message).toContain("sub-1/eeg/short.edf [SHA256E]");
-    expect(refusal.message).not.toContain("abc123");
+    // Carried as found: the version still gets its manifest.
+    expect(m.files["sub-1/eeg/short.edf"].checksum).toBe("sha256:abc123");
+    expect(m.files["sub-1/eeg/ok.edf"].checksum).toBe(`sha256:${X_DIGEST}`);
+    // Reported once, with the dataset, version, path and backend, and no checksum value.
+    expect(warned).toEqual([
+      "[manifest] MALFORMED CHECKSUM dataset=test version=v1.0.0 count=1 examples=sub-1/eeg/short.edf [SHA256E]",
+    ]);
   });
 
   test("keys of no known hash backend, and size-less or SHA3 keys, are carried and never refused (#2118)", async () => {
