@@ -39,10 +39,11 @@ Trust these for how things work today.
 
 | Document | What it is | Destination |
 |---|---|---|
-| [systems-inventory.md](https://docs.nemar.org/admin/operations/systems-inventory/) | Every host and service, with paths, cron schedules, and deploy procedures. Expands the map in `AGENTS.md`. | private |
+| [systems-inventory.md](https://docs.nemar.org/admin/operations/systems-inventory/) | Every host and service, with paths, cron schedules, and deploy procedures. Expands the page map in [`.rules/docs-site.md`](../.rules/docs-site.md). | private |
 | [validated_workflows.md](https://docs.nemar.org/admin/operations/validated-workflows/) | Workflows proven by prototype, with the gotchas. The git-annex and staging-to-final recipes live here. | private |
 | [release-safety-playbook.md](release-safety-playbook.md) | Environments, promotion path, pre-release checks. | public |
 | [recover-runbook.md](recover-runbook.md) | Recovering 0-byte imports (epic #967 Phase 5). | public |
+| [compute-program/README.md](compute-program/README.md) | The compute program's roadmap and driver playbook: epics #2005, #2014, #2021, nemarOrg/nemar-process#1 and nemarOrg/website#493, the order, the roles and models, the loop for each phase, and when to escalate. [`compute-program/implementation-notes.md`](compute-program/implementation-notes.md) says where each pattern lives in the code. | public |
 | [access_control.md](access_control.md) | How collaborator-based access is implemented. | public |
 | [dataset_workflow.md](dataset_workflow.md) | Dataset lifecycle: IDs, upload, download, versioning. | public |
 | [pr_architecture.md](pr_architecture.md) | PR + staging mechanics. **The branch-protection payload it described is superseded**; see ADR 0001. | public |
@@ -69,6 +70,7 @@ here, since an index that misses a document cannot classify it either.
 | [draft-eegdash-zarr-issues.sh](draft-eegdash-zarr-issues.sh) | Script drafting the EEGDash Zarr issues. The one non-markdown document here, which is why a markdown-only sweep missed it. | public |
 | [plans/spec-pr1.md](plans/spec-pr1.md) | Column-budget rebuild spec (issue #1182). In `plans/`, which a top-level sweep missed. | public |
 | [publication-review-design.md](publication-review-design.md) | The analysis behind ADR 0102 (epic #1726): what was read, the pull-request review compared with the publication review, the data flow, the screen-first options, the cost arithmetic, the calibration plan, the initial vocabularies, the refined phase plan and the risks. Analysis, not a ruling. | public |
+| [first-party-processing-design.md](first-party-processing-design.md) | **Draft** design for NEMAR's own cleaning, independent component analysis and quality assurance with signalJourney provenance and DOI-bearing products. Three owner questions are open in #1750, #1751 and #1752; the plan is not final and no epic is filed. Supporting files are in `first-party-processing/`: the first cut (`design-v1.md`, historical, still cited by v2), the measured evidence, and the SDSC Expanse spike code and results (`sp-p/`). | public |
 
 ## Research — point-in-time findings
 
@@ -109,6 +111,7 @@ A table rather than a list, so each carries a destination like every other docum
 | [plan-import-robustness.md](plan-import-robustness.md) | public |
 | [plan-phase2-retry-engine.md](plan-phase2-retry-engine.md) | public |
 | [draft-1023-service-access-endpoints-plan.md](draft-1023-service-access-endpoints-plan.md) | public |
+| [first-party-processing/design-v1.md](first-party-processing/design-v1.md) | public |
 
 Historical does not mean harmless: a completed plan can still name things that are current, which
 is why these are classified individually rather than as a block.
