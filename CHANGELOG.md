@@ -39,7 +39,7 @@ Third-party compute (`nemar compute`) and the partner contract are not in this r
 - **A plain ORCID sign-in no longer links the iD to the account already signed in (ADR 0119 rule 10).**
   `GET /auth/orcid/start` starts a sign-in whatever its `mode` says; only the form POST from Settings, which checks the Origin and needs a session, starts a link or a relink.
   A sign-in signs in the account the iD names, or starts a sign-up for an iD no account holds, and always issues a fresh session.
-  The released website's "Connect your ORCID" is a link, so until the website's form POST is released (website #501) it starts a sign-up instead of a link (see Deploy coupling).
+  Website 0.2.37 carries the form POST; a website older than that starts a sign-up instead of a link (see Deploy coupling).
 - **Email-code sign-in is closed outside development and test (#2112).**
   `/auth/code/request` answers the same masked success without issuing a code, and `/auth/code/verify` answers 401, so nothing can obtain or redeem a sign-in code in production.
   The codes that confirm or change an email address for a signed-in account are separate and unchanged.
@@ -133,6 +133,8 @@ Third-party compute (`nemar compute`) and the partner contract are not in this r
 - **Then check ORCID sign-in end to end, turn `HOST_PREFIXED_SESSION_COOKIE` on, and check sign-in again.**
   The flag is a Worker secret, or a `[vars]` entry added by a reviewed change that edits `backend/test/session-cookie-name.test.ts`; a dashboard variable is dropped by the next deploy.
   Turning the cookie flag on before the website reads the new name logs everyone out of the website.
+  Before turning it on, count the active accounts that have no verified ORCID iD (a read-only query on `users`, `orcid_verified = 0`).
+  With the flag on, a session read under the legacy `nemar_session` name is no longer slid and cannot start an ORCID link, and email-code sign-in is closed, so such an account can connect an iD only with `nemar auth profile orcid link` or through an owner's edit; ask those people to connect while the flag is off, or tell them how.
 - **Rolling back.**
   The migrations add tables and indexes, one column on an existing table (`users.oidc_subject`, filled for every user), triggers (0130 replaces two) and four empty pools, and the 0.10.32 Worker reads none of them, so a rollback to 0.10.32 is safe while the cookie flag is off; ORCID sign-ins in flight fail once, as at deploy.
   Once the flag is on, a rollback below 0.10.33 signs out everyone who signed in since, because 0.10.32 does not read `__Host-nemar_session`.
